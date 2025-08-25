@@ -46,6 +46,7 @@ class Config:
         self.zotero_api_key = os.getenv("ZOTERO_API_KEY", "")
         self.pubmed_email = os.getenv("PUBMED_EMAIL", "")
         self.crossref_mailto = os.getenv("CROSSREF_MAILTO", "")
+        self.scopus_api_key = os.getenv("SCOPUS_API_KEY", "")
         
         # Search Parameters
         self.query = os.getenv("QUERY", "cognitive behavioral therapy AND depression")
@@ -115,6 +116,7 @@ class Config:
             "zotero_api_key": bool(self.zotero_api_key),
             "pubmed_email": bool(self.pubmed_email),
             "crossref_mailto": bool(self.crossref_mailto),
+            "scopus_api_key": bool(self.scopus_api_key),
         }
         return credentials
     
