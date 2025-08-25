@@ -1,0 +1,9 @@
+# Fichiers Excel temporaires
+~$*.xlsx
+
+# Dossiers d'outputs
+data/outputs/
+
+# Cache Python
+__pycache__/
+*.pyc
