@@ -373,13 +373,51 @@ def recherche_bibliographique():
             st.session_state['extended_results_df'] = extended_df
             st.success("✅ Transformation réussie! Voir l'onglet 'Transformer Excel' pour les résultats")
         
-        # Export Excel classique
+        # Export Excel avec téléchargement direct
         st.subheader("📥 Export Excel")
-        if st.button("📊 Exporter résultats bruts", type="primary"):
-            export_path = f"data/outputs/{export_filename}"
-            Path("data/outputs").mkdir(parents=True, exist_ok=True)
-            df.to_excel(export_path, index=False)
-            st.success(f"✅ Export réussi: {export_path}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"Prêt à télécharger {len(df)} articles")
+        
+        with col2:
+            if st.button("📊 Préparer téléchargement", type="primary"):
+                # Créer un buffer en mémoire pour le fichier Excel
+                output = io.BytesIO()
+                
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Feuille principale avec tous les résultats
+                    df.to_excel(writer, sheet_name='Résultats', index=False)
+                    
+                    # Feuille de statistiques
+                    stats_data = {
+                        'Métrique': [
+                            'Total articles',
+                            'Articles avec résumé',
+                            'Années couvertes', 
+                            'Citations totales'
+                        ],
+                        'Valeur': [
+                            len(df),
+                            (df['abstract'] != "").sum() if 'abstract' in df.columns else 0,
+                            f"{df['year'].min()}-{df['year'].max()}" if 'year' in df.columns else "N/A",
+                            df['cited_by'].sum() if 'cited_by' in df.columns else 0
+                        ]
+                    }
+                    stats_df = pd.DataFrame(stats_data)
+                    stats_df.to_excel(writer, sheet_name='Statistiques', index=False)
+                
+                output.seek(0)
+                
+                # Bouton de téléchargement direct
+                st.download_button(
+                    label="⬇️ Télécharger Excel",
+                    data=output.getvalue(),
+                    file_name=export_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="secondary"
+                )
+                st.success("✅ Fichier prêt pour téléchargement!")
 
 def transformation_excel():
     """Interface pour la transformation d'Excel existants."""
