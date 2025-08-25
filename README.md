@@ -429,5 +429,6 @@ MIT License - voir [LICENSE](LICENSE) pour détails.
 **🎉 Automatisez vos revues de littérature et concentrez-vous sur l'analyse !**
 
 *Développé avec ❤️ pour la communauté de recherche scientifique*
-#   S c i S c r e e n  
+#   S c i S c r e e n 
+ 
  
