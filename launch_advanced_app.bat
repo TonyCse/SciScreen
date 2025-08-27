@@ -23,9 +23,9 @@ if %ERRORLEVEL% NEQ 0 (
 REM Lancer l'application avancée
 echo.
 echo Demarrage de l'application avancee...
-echo Acces: http://localhost:8505
+echo Acces: http://localhost:8530
 echo.
-python -m streamlit run app/advanced_research_app.py --server.port 8505
+python -m streamlit run app/advanced_research_app.py --server.port 8530
 
 REM Si Python n'est pas trouvé
 if %ERRORLEVEL% NEQ 0 (

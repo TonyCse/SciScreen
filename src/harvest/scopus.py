@@ -272,3 +272,4 @@ def search_scopus(
         year_to=year_to,
         max_results=max_results
     )
+

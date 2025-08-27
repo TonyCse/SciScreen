@@ -1,0 +1,10 @@
+{
+  "name": "swipe_card",
+  "description": "Simple swipe card component for Streamlit (left/right/down)",
+  "frontend": {
+    "index": "index.html"
+  }
+}
+
+
+

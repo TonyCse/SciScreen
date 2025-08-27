@@ -182,3 +182,4 @@ print("   📄 GUIDE_RECHERCHE.md - Guide d'utilisation complet")
 print("   📄 README.md - Documentation générale")
 
 print("\n🎉 Tout est prêt pour la recherche bibliographique!")
+

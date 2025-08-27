@@ -1,1414 +1,1263 @@
-"""Application Streamlit ultra-avancée pour la recherche bibliographique.
-
-Fonctionnalités :
-1. Vraies APIs scientifiques (OpenAlex, Semantic Scholar, PubMed, Crossref)
-2. Import/customisation/export Excel avancé
-3. Interface d'édition interactive
-4. Suppression/modification de lignes
-5. Export personnalisé
-"""
-
-import sys
-from pathlib import Path
 import pandas as pd
 import streamlit as st
-from datetime import datetime
-import time
 import io
-import requests
-import requests.exceptions
-import json
-from typing import List, Dict, Any
-import xml.etree.ElementTree as ET
-from urllib.parse import quote
+import re
+import mysql.connector
+from werkzeug.security import generate_password_hash, check_password_hash
+import time
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from datetime import datetime, timedelta
 
-# Ajouter le répertoire src au chemin Python
-src_path = Path(__file__).parent.parent / "src"
-sys.path.insert(0, str(src_path))
+# === CONNEXION MYSQL ===
+def get_connection():
+    return mysql.connector.connect(
+        host="srv494.hstgr.io", 
+        user="u499568465_tonycseresznya",
+        password="Sci771025!", 
+        database="u499568465_Sci"
+    )
 
-# Configuration des APIs
-API_CONFIG = {
-    "openalex": {
-        "base_url": "https://api.openalex.org",
-        "rate_limit": 10,  # requêtes par seconde
-        "free": True
-    },
-    "semantic_scholar": {
-        "base_url": "https://api.semanticscholar.org/graph/v1",
-        "rate_limit": 100,  # requêtes par minute
-        "free": True
-    },
-    "pubmed": {
-        "base_url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils",
-        "rate_limit": 3,  # requêtes par seconde
-        "free": True
-    },
-    "crossref": {
-        "base_url": "https://api.crossref.org",
-        "rate_limit": 50,  # requêtes par seconde avec politeness
-        "free": True
+# === USERS AUTH ===
+def check_user(username, password):
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if user and check_password_hash(user["password"], password):
+        return True
+    return False
+
+# === ARTICLES BDD ===
+def insert_article_in_db(article_data, status, user):
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # D'abord vérifier si les nouvelles colonnes existent, sinon les créer
+    try:
+        cursor.execute("DESCRIBE articles_tri")
+        existing_columns = [col[0] for col in cursor.fetchall()]
+        
+        new_columns = [
+            ('issn', 'TEXT'),
+            ('abs_lo_uo', 'TEXT'),
+            ('notes', 'TEXT'),
+            ('type_revue', 'TEXT'),
+            ('wl_mesure', 'TEXT'),
+            ('chir_participants', 'TEXT'),
+            ('specialiste', 'TEXT'),
+            ('intervention', 'TEXT'),
+            ('technique', 'TEXT'),
+            ('contexte', 'TEXT'),
+            ('simulation', 'TEXT'),
+            ('additional_outcomes', 'TEXT')
+        ]
+        
+        for col_name, col_type in new_columns:
+            if col_name not in existing_columns:
+                cursor.execute(f"ALTER TABLE articles_tri ADD COLUMN {col_name} {col_type}")
+        
+        conn.commit()
+    except Exception as e:
+        print(f"Erreur lors de l'ajout des colonnes: {e}")
+    
+    # Insérer l'article avec toutes les colonnes
+    sql = """
+    INSERT INTO articles_tri 
+    (title, authors, journal, year, abstract, doi, url, issn, abs_lo_uo, notes, 
+     type_revue, wl_mesure, chir_participants, specialiste, intervention, 
+     technique, contexte, simulation, additional_outcomes, status, user, date_action)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+    """
+    cursor.execute(sql, (
+        article_data.get("title", ""),
+        article_data.get("authors", ""),
+        article_data.get("journal", ""),
+        article_data.get("year", ""),
+        article_data.get("abstract", ""),
+        article_data.get("doi", ""),
+        article_data.get("url", ""),
+        article_data.get("issn", ""),
+        article_data.get("abs_lo_uo", ""),
+        article_data.get("notes", ""),
+        article_data.get("type_revue", ""),
+        article_data.get("wl_mesure", ""),
+        article_data.get("chir_participants", ""),
+        article_data.get("specialiste", ""),
+        article_data.get("intervention", ""),
+        article_data.get("technique", ""),
+        article_data.get("contexte", ""),
+        article_data.get("simulation", ""),
+        article_data.get("additional_outcomes", ""),
+        status,
+        user
+    ))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+def fetch_articles_from_db():
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM articles_tri ORDER BY date_action DESC")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return pd.DataFrame(rows)
+
+def update_article_in_db(article_id, updated_data):
+    """Met à jour un article dans la base de données avec les nouvelles données"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Convertir les types numpy en types Python natifs
+    def convert_value(value):
+        if pd.isna(value):
+            return None
+        elif hasattr(value, 'item'):  # numpy types
+            return value.item()
+        elif isinstance(value, (int, float, str, bool)):
+            return value
+        else:
+            return str(value)
+    
+    # Convertir toutes les valeurs
+    converted_data = {key: convert_value(value) for key, value in updated_data.items()}
+    converted_id = convert_value(article_id)
+    
+    # Construire la requête UPDATE dynamiquement
+    set_clause = ", ".join([f"{key} = %s" for key in converted_data.keys()])
+    sql = f"UPDATE articles_tri SET {set_clause} WHERE id = %s"
+    
+    # Valeurs à mettre à jour + l'ID
+    values = list(converted_data.values()) + [converted_id]
+    
+    cursor.execute(sql, values)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+# === UTILITAIRES ===
+def smart_column_mapping(df):
+    mappings = {
+        'title': ['title','article title','titre','nom','article','name', 'article public author title'],
+        'authors': ['authors','auteurs','author'],
+        'journal': ['journal name','journal','revue','publication'],
+        'year': ['publication year','year','année','annee','date'],
+        'abstract': ['abstract','abstract note','résumé','resume','description'],
+        'doi': ['doi'],
+        'url': ['url','link'],
+        'issn': ['issn'],
+        'abs_lo_uo': ['abs lo uo', 'abs_lo_uo', 'abslouo'],
+        'notes': ['notes', 'note'],
+        'type_revue': ['type revue', 'type_revue', 'typerevue'],
+        'wl_mesure': ['wl = mesure', 'wl_mesure', 'wlmesure'],
+        'chir_participants': ['chir = participants', 'chir_participants', 'chirparticipants'],
+        'specialiste': ['specialiste', 'spécialiste'],
+        'intervention': ['intervention'],
+        'technique': ['technique'],
+        'contexte': ['contexte', 'context'],
+        'simulation': ['simulation'],
+        'additional_outcomes': ['additional outcomes / exclusion', 'additional_outcomes', 'additionaloutcomes']
+    }
+    available_cols = df.columns.tolist()
+    available_lower = [c.lower().strip() for c in available_cols]
+    final_mapping = {}
+    for target, options in mappings.items():
+        for opt in options:
+            if opt.lower() in available_lower:
+                idx = available_lower.index(opt.lower())
+                final_mapping[target] = available_cols[idx]
+                break
+    return final_mapping
+
+def get_article_field(article, field_name, mapping, default=""):
+    if field_name in mapping and mapping[field_name] in article:
+        value = article[mapping[field_name]]
+        if pd.notna(value):
+            return str(value)
+    return default
+
+def safe_year_conversion(val, default="Année inconnue"):
+    try:
+        y = int(val)
+        if 1800 < y < 2035:
+            return str(y)
+        return default
+    except:
+        return default
+
+def highlight_text(text, keywords):
+    if not keywords or text == "": 
+        return text
+    
+    # Convertir en string au cas où ce serait autre chose
+    text = str(text)
+    
+    for word in keywords:
+        if word.strip():
+            # Échapper les caractères spéciaux pour la regex
+            escaped_word = re.escape(word.strip())
+            regex = re.compile(rf"({escaped_word})", re.IGNORECASE)
+            # Utiliser des guillemets doubles et échapper le contenu HTML
+            text = regex.sub(
+                lambda m: f'<span style="background-color:#00e1c6;color:#000;font-weight:600;border-radius:4px;padding:2px 4px;display:inline-block;">{m.group(1)}</span>',
+                text
+            )
+    return text
+
+# === COLONNES D'AFFICHAGE ===
+def format_display_columns(df):
+    """
+    Formate le DataFrame avec les colonnes demandées pour l'affichage et l'export
+    """
+    display_df = pd.DataFrame()
+    
+    # Ajouter l'ID en première colonne si disponible
+    if "id" in df.columns:
+        display_df["ID"] = df["id"]
+    
+    # Mapping des colonnes selon l'image fournie
+    column_mapping = {
+        "Article Public Author Title": "title" if "title" in df.columns else None,
+        "Journal": "journal" if "journal" in df.columns else None,
+        "ISSN": "issn" if "issn" in df.columns else None,
+        "DOI": "doi" if "doi" in df.columns else None,
+        "URL": "url" if "url" in df.columns else None,
+        "Abstract Note": "abstract" if "abstract" in df.columns else None,
+        "ABS LO UO": "abs_lo_uo" if "abs_lo_uo" in df.columns else None,
+        "Notes": "notes" if "notes" in df.columns else None,
+        "Type revue": "type_revue" if "type_revue" in df.columns else None,
+        "WL = mesure": "wl_mesure" if "wl_mesure" in df.columns else None,
+        "Chir = participants": "chir_participants" if "chir_participants" in df.columns else None,
+        "Specialiste": "specialiste" if "specialiste" in df.columns else None,
+        "Intervention": "intervention" if "intervention" in df.columns else None,
+        "Technique": "technique" if "technique" in df.columns else None,
+        "Contexte": "contexte" if "contexte" in df.columns else None,
+        "Simulation": "simulation" if "simulation" in df.columns else None,
+        "additional outcomes / exclusion": "additional_outcomes" if "additional_outcomes" in df.columns else None
+    }
+    
+    # Créer le DataFrame d'affichage avec les colonnes dans l'ordre souhaité
+    for display_col, source_col in column_mapping.items():
+        if source_col and source_col in df.columns:
+            display_df[display_col] = df[source_col]
+        else:
+            # Ajouter une colonne vide si la colonne n'existe pas
+            display_df[display_col] = ""
+    
+    # Préserver l'index original pour la correspondance
+    display_df.index = df.index
+    
+    return display_df
+
+# === EXPORT ===
+def export_excel(sub_df, filename):
+    # Formater les colonnes pour l'export
+    formatted_df = format_display_columns(sub_df)
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        formatted_df.to_excel(writer, index=False, sheet_name="Articles")
+        worksheet = writer.sheets["Articles"]
+        for col_cells in worksheet.columns:
+            max_length = 0
+            col = col_cells[0].column_letter
+            for cell in col_cells:
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+            worksheet.column_dimensions[col].width = min(max_length + 2, 50)  # Limiter la largeur max à 50
+    output.seek(0)
+    st.download_button(
+        f"⬇️ Exporter {filename}",
+        output.getvalue(),
+        file_name=f"{filename}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# === APP CONFIG ===
+st.set_page_config(page_title="NeuroScience Literature Triager", page_icon="🧠", layout="wide")
+
+# === CSS ===
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+* { 
+    font-family: 'Inter', sans-serif; 
+    scroll-behavior: smooth;
+}
+
+:root {
+    --neuro-primary: #00d4aa;
+    --neuro-secondary: #0099ff;
+    --neuro-accent: #ff6b9d;
+    --neuro-dark: #0a0e27;
+    --neuro-darker: #050815;
+    --neuro-light: #1a1f3a;
+    --neuro-glow: #00f5d4;
+    --neuro-warning: #ffa726;
+    --neuro-error: #ff5252;
+    --neuro-text: #e8eaed;
+    --neuro-muted: #9aa0a6;
+}
+
+/* Animations neurales */
+@keyframes pulse-neural {
+    0%, 100% { opacity: 0.6; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.05); }
+}
+
+@keyframes float-brain {
+    0%, 100% { transform: translateY(0px) rotate(15deg); }
+    50% { transform: translateY(-10px) rotate(15deg); }
+}
+
+@keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 20px rgba(0, 245, 212, 0.3); }
+    50% { box-shadow: 0 0 40px rgba(0, 245, 212, 0.6); }
+}
+
+/* Header avec cerveau neural */
+.main-header {
+    background: linear-gradient(135deg, var(--neuro-darker) 0%, var(--neuro-dark) 30%, #1a237e 70%, #3949ab 100%);
+    padding: 50px 40px;
+    margin: -1rem -1rem 40px -1rem;
+    color: var(--neuro-text);
+    width: calc(100% + 2rem);
+    position: relative;
+    overflow: hidden;
+    border-bottom: 3px solid var(--neuro-primary);
+    box-shadow: 0 8px 32px rgba(0, 212, 170, 0.2);
+}
+.st-emotion-cache-18kf3ut{
+width: 90% !important;
+margin: 0 auto !important;
+padding: 0 !important;
+}
+
+.st-emotion-cache-zy6yx3{
+    padding: 0 !important;
+}
+
+.main-header::before {
+    content: '';
+    position: absolute;
+    top: 0%;
+    right: 5%;
+    width: 300px;
+    height: 300px;
+    background-image: url('https://purepng.com/public/uploads/large/brain-outline-i4u.png');
+    background-size: contain;
+    background-repeat: no-repeat;
+    background-position: center;
+    opacity: 0.75;
+    filter: invert(1);
+    transform: rotate(15deg);
+    animation: float-brain 6s ease-in-out infinite;
+}
+
+.main-header h1 {
+    font-size: 2.8rem;
+    font-weight: 700;
+    margin: 0;
+    background: linear-gradient(45deg, var(--neuro-primary), var(--neuro-secondary), var(--neuro-accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    text-shadow: 0 0 30px rgba(0, 245, 212, 0.3);
+    position: relative;
+    z-index: 2;
+}
+
+.main-header p {
+    font-size: 1.2rem;
+    margin-top: 10px;
+    color: var(--neuro-muted);
+    font-weight: 400;
+    position: relative;
+    z-index: 2;
+}
+
+/* Système de grille neural */
+.st-emotion-cache-zy6yx3 {
+    padding-left: 0rem;
+    padding-right: 0rem;
+}
+
+.stElementContainer:not(:first-of-type):not(:nth-of-type(2)):not(:last-of-type) {
+    width: 90% !important;
+    margin: 0 auto !important;
+}
+
+.st-emotion-cache-wfksaw {
+    align-items: center;
+}
+
+/* Footer neural */
+.footer {
+    background: linear-gradient(135deg, var(--neuro-darker), var(--neuro-dark), #1a237e);
+    margin: 80px -1rem -1rem -1rem;
+    padding: 30px;
+    text-align: center;
+    color: var(--neuro-text);
+    width: calc(100% + 2rem);
+    border-top: 3px solid var(--neuro-primary);
+    position: relative;
+    overflow: hidden;
+}
+
+.footer::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: radial-gradient(circle at 50% 50%, rgba(0, 245, 212, 0.1) 0%, transparent 70%);
+    pointer-events: none;
+}
+
+/* Conteneur principal neural */
+.main-content {
+    width: 90%;
+    margin: 0 auto;
+    padding: 0;
+    position: relative;
+}
+
+/* Cartes d'articles neurales */
+.article-card {
+    background: linear-gradient(145deg, var(--neuro-dark), var(--neuro-light));
+    border-radius: 24px;
+    padding: 35px;
+    margin: 30px auto;
+    max-width: 950px;
+    border: 2px solid var(--neuro-primary);
+    box-shadow: 
+        0 20px 40px rgba(0, 0, 0, 0.3),
+        0 0 0 1px rgba(0, 245, 212, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    position: relative;
+    overflow: hidden;
+    transition: all 0.3s ease;
+}
+
+.article-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--neuro-primary), var(--neuro-secondary), var(--neuro-accent));
+    animation: pulse-neural 3s ease-in-out infinite;
+}
+
+.article-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 
+        0 25px 50px rgba(0, 0, 0, 0.4),
+        0 0 0 1px rgba(0, 245, 212, 0.2),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.card-title {
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: var(--neuro-text) !important;
+    margin-bottom: 25px;
+    line-height: 1.4;
+}
+
+/* Méta-données neurales */
+.meta-item {
+    background: rgba(0, 212, 170, 0.08);
+    border: 1px solid rgba(0, 212, 170, 0.2);
+    padding: 15px;
+    border-radius: 12px;
+    margin-bottom: 12px;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(10px);
+}
+
+.meta-item:hover {
+    background: rgba(0, 212, 170, 0.12);
+    border-color: rgba(0, 212, 170, 0.4);
+    transform: translateX(5px);
+}
+
+.meta-label {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--neuro-primary);
+    margin-bottom: 5px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.meta-value {
+    color: var(--neuro-text);
+    font-weight: 400;
+    line-height: 1.5;
+}
+
+/* Section résumé neural */
+.abstract-section {
+    background: linear-gradient(135deg, #ffffff, #f8f9fa);
+    color: #1a1a1a;
+    padding: 25px;
+    border-radius: 16px;
+    margin-top: 20px;
+    border: 2px solid var(--neuro-primary);
+    box-shadow: 
+        0 10px 25px rgba(0, 212, 170, 0.1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    position: relative;
+}
+
+.abstract-section strong {
+    color: var(--neuro-dark);
+    font-weight: 600;
+}
+
+/* Liens neuraux */
+.st-emotion-cache-r44huj a {
+    color: var(--neuro-secondary) !important;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: all 0.2s ease;
+}
+
+.st-emotion-cache-r44huj a:hover {
+    color: var(--neuro-primary) !important;
+    border-bottom-color: var(--neuro-primary);
+}
+
+.st-emotion-cache-tn0cau {
+    align-items: center;
+}
+
+/* Boutons neuraux */
+.stButton > button {
+    background: linear-gradient(135deg, var(--neuro-primary), var(--neuro-secondary)) !important;
+    border: none !important;
+    border-radius: 12px !important;
+    color: white !important;
+    font-weight: 600 !important;
+    padding: 12px 24px !important;
+    transition: all 0.3s ease !important;
+    box-shadow: 0 4px 15px rgba(0, 212, 170, 0.3) !important;
+}
+
+.stButton > button:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 20px rgba(0, 212, 170, 0.4) !important;
+    animation: glow-pulse 1s ease-in-out !important;
+}
+
+/* Métriques neurales */
+.metric-container {
+    background: linear-gradient(145deg, var(--neuro-dark), var(--neuro-light));
+    border-radius: 16px;
+    padding: 20px;
+    border: 1px solid var(--neuro-primary);
+    text-align: center;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+.metric-container::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--neuro-primary), var(--neuro-accent));
+}
+
+.metric-container:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 10px 25px rgba(0, 212, 170, 0.2);
+}
+
+/* Graphiques neuraux */
+.js-plotly-plot {
+    border-radius: 16px !important;
+    overflow: hidden !important;
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2) !important;
+    border: 1px solid rgba(0, 212, 170, 0.2) !important;
+}
+
+/* Barres de progression neurales */
+.stProgress > div > div {
+    background: linear-gradient(90deg, var(--neuro-primary), var(--neuro-secondary)) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 0 15px rgba(0, 245, 212, 0.4) !important;
+}
+
+/* Responsive neural */
+@media (max-width: 768px) {
+    .main-content {
+        width: 95%;
+    }
+    
+    .main-header {
+        padding: 40px 20px;
+    }
+    
+    .main-header h1 {
+        font-size: 2.2rem;
+    }
+    
+    .main-header::before {
+        width: 200px;
+        height: 200px;
+        top: -10%;
+        right: -10%;
+    }
+    
+    .footer {
+        padding: 25px 15px;
+    }
+    
+    .article-card {
+        padding: 25px;
+        margin: 20px auto;
     }
 }
 
-class OpenAlexAPI:
-    """Client pour l'API OpenAlex."""
+/* Effets de glow pour les éléments interactifs */
+.stSelectbox > div > div,
+.stTextInput > div > div,
+.stNumberInput > div > div {
+    border-radius: 12px !important;
+    border: 1px solid var(--neuro-primary) !important;
+    color: var(--neuro-text) !important;
+}
+
+.stSelectbox > div > div:focus,
+.stTextInput > div > div:focus,
+.stNumberInput > div > div:focus {
+    box-shadow: 0 0 0 2px var(--neuro-primary) !important;
+    border-color: var(--neuro-glow) !important;
+}
+
+/* Tables neurales */
+.stDataFrame {
+    border-radius: 16px !important;
+    overflow: hidden !important;
+    border: 2px solid var(--neuro-primary) !important;
+    box-shadow: 0 8px 25px rgba(0, 212, 170, 0.1) !important;
+}
+
+/* Messages neuraux */
+.stAlert {
+    border-radius: 12px !important;
+    border-left: 4px solid var(--neuro-primary) !important;
+    background: rgba(0, 212, 170, 0.1) !important;
+    backdrop-filter: blur(10px) !important;
+}
+
+/* Sidebar neural si présent */
+.css-1d391kg {
+    background: linear-gradient(180deg, var(--neuro-darker), var(--neuro-dark)) !important;
+    border-right: 2px solid var(--neuro-primary) !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# === HEADER ===
+st.markdown("""
+<div class="main-header">
+  <h1>🧠 NeuroScience Literature Triager</h1>
+  <p>Analyse, tri et sauvegarde des articles scientifiques</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Début du conteneur principal centré
+st.markdown('<div class="main-content">', unsafe_allow_html=True)
+
+# === GESTION DE SESSION ===
+def initialize_session():
+    """Initialise les variables de session avec persistance"""
+    if "logged_in" not in st.session_state:
+        st.session_state["logged_in"] = False
+    if "username" not in st.session_state:
+        st.session_state["username"] = None
+    if "remember_login" not in st.session_state:
+        st.session_state["remember_login"] = False
+    if "login_time" not in st.session_state:
+        st.session_state["login_time"] = None
     
-    def __init__(self):
-        self.base_url = API_CONFIG["openalex"]["base_url"]
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'LitReviewPipeline/1.0 (https://github.com/user/lit-review-pipeline)',
-            'Accept': 'application/json'
-        })
+    # Vérifier la persistance via query params (simulation de cookies)
+    query_params = st.query_params
+    if "auth_token" in query_params and "username" in query_params:
+        # Simple vérification de token (dans un vrai système, utiliser JWT)
+        token = query_params["auth_token"]
+        username = query_params["username"]
+        if token == f"auth_{username}_token" and not st.session_state["logged_in"]:
+            st.session_state["logged_in"] = True
+            st.session_state["username"] = username
+            st.session_state["remember_login"] = True
+            st.session_state["login_time"] = datetime.now()
+
+def set_persistent_login(username):
+    """Configure la persistance de connexion"""
+    if st.session_state.get("remember_login", False):
+        # Ajouter un token dans l'URL pour simuler la persistance
+        st.query_params["auth_token"] = f"auth_{username}_token"
+        st.query_params["username"] = username
+
+def logout_user():
+    """Déconnecte l'utilisateur et nettoie la session"""
+    st.session_state["logged_in"] = False
+    st.session_state["username"] = None
+    st.session_state["remember_login"] = False
+    st.session_state["login_time"] = None
     
-    def search_works(self, query: str, year_from: int, year_to: int, max_results: int = 100) -> pd.DataFrame:
-        """Rechercher des articles sur OpenAlex."""
-        try:
-            params = {
-                'search': query,
-                'filter': f'publication_year:{year_from}-{year_to}',
-                'per-page': min(max_results, 200),
-                'cursor': '*',
-                'sort': 'cited_by_count:desc'
-            }
-            
-            response = self.session.get(f"{self.base_url}/works", params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            articles = []
-            
-            if not data or 'results' not in data:
-                return pd.DataFrame()
-            
-            for work in data.get('results', []):
-                if not work or not isinstance(work, dict):
-                    continue
-                    
-                # Extraction sécurisée des données
-                primary_location = work.get('primary_location') or {}
-                source_info = primary_location.get('source') or {}
-                
-                article = {
-                    'source': 'OpenAlex',
-                    'title': work.get('title') or 'Sans titre',
-                    'abstract': (work.get('abstract_inverted_index') and 'Résumé disponible') or work.get('abstract') or '',
-                    'authors': self._format_authors(work.get('authorships') or []),
-                    'journal': source_info.get('display_name') or 'Journal non spécifié',
-                    'year': work.get('publication_year') or 0,
-                    'doi': (work.get('doi') or '').replace('https://doi.org/', ''),
-                    'cited_by': work.get('cited_by_count') or 0,
-                    'url': work.get('id') or '',
-                    'type': work.get('type') or 'article',
-                    'open_access': (work.get('open_access') or {}).get('is_oa', False)
-                }
-                articles.append(article)
-            
-            return pd.DataFrame(articles)
-            
-        except Exception as e:
-            st.error(f"Erreur OpenAlex: {e}")
-            return pd.DataFrame()
+    # Nettoyer les query params pour la persistance
+    if "auth_token" in st.query_params:
+        del st.query_params["auth_token"]
+    if "username" in st.query_params:
+        del st.query_params["username"]
     
-    def _format_authors(self, authorships: List[Dict]) -> str:
-        """Formater la liste des auteurs."""
-        authors = []
-        for auth in authorships[:5]:  # Limiter à 5 auteurs
-            author = auth.get('author', {})
-            name = author.get('display_name', '')
-            if name:
-                authors.append(name)
+    # Nettoyer d'autres variables de session si nécessaire
+    if "triage_index" in st.session_state:
+        del st.session_state["triage_index"]
+    if "excel_data" in st.session_state:
+        del st.session_state["excel_data"]
+
+# Initialiser la session
+initialize_session()
+
+# === LOGIN ===
+if not st.session_state["logged_in"]:
+    col_login1, col_login2, col_login3 = st.columns([1, 2, 1])
+    
+    with col_login2:
+        st.markdown("""
+        <div style="background: linear-gradient(145deg,#1a1a2e,#16213e); 
+                    padding: 40px; border-radius: 20px; border: 1px solid rgba(0,225,198,0.3);
+                    box-shadow: 0 15px 35px rgba(0,0,0,0.4); text-align: center;">
+            <h2 style="color: #00e1c6; margin-bottom: 30px;">🔐 Connexion</h2>
+        </div>
+        """, unsafe_allow_html=True)
         
-        result = '; '.join(authors)
-        if len(authorships) > 5:
-            result += ' et al.'
-        return result
-
-class SemanticScholarAPI:
-    """Client pour l'API Semantic Scholar."""
-    
-    def __init__(self):
-        self.base_url = API_CONFIG["semantic_scholar"]["base_url"]
-        self.session = requests.Session()
-        self.session.headers.update({
-            'Accept': 'application/json'
-        })
-    
-    def search_papers(self, query: str, year_from: int, year_to: int, max_results: int = 100) -> pd.DataFrame:
-        """Rechercher des articles sur Semantic Scholar."""
-        try:
-            # Limiter les requêtes pour éviter les erreurs 429
-            max_results = min(max_results, 50)
-            
-            params = {
-                'query': query,
-                'year': f'{year_from}-{year_to}',
-                'limit': max_results,
-                'fields': 'paperId,title,abstract,authors,journal,year,citationCount,url,venue,publicationTypes,isOpenAccess'
-            }
-            
-            # Délai pour respecter les limites
-            time.sleep(1)
-            
-            response = self.session.get(f"{self.base_url}/paper/search", params=params, timeout=30)
-            
-            if response.status_code == 429:
-                st.warning("⚠️ Semantic Scholar: Limite de taux atteinte, attente...")
-                time.sleep(10)
-                response = self.session.get(f"{self.base_url}/paper/search", params=params, timeout=30)
-            
-            response.raise_for_status()
-            
-            data = response.json()
-            articles = []
-            
-            if not data or 'data' not in data:
-                return pd.DataFrame()
-            
-            for paper in data.get('data', []):
-                if not paper or not isinstance(paper, dict):
-                    continue
-                
-                journal_info = paper.get('journal') or {}
-                
-                article = {
-                    'source': 'Semantic Scholar',
-                    'title': paper.get('title') or 'Sans titre',
-                    'abstract': paper.get('abstract') or '',
-                    'authors': self._format_authors(paper.get('authors') or []),
-                    'journal': journal_info.get('name') or paper.get('venue') or 'Journal non spécifié',
-                    'year': paper.get('year') or 0,
-                    'doi': '',  # Semantic Scholar ne fournit pas directement le DOI
-                    'cited_by': paper.get('citationCount') or 0,
-                    'url': paper.get('url') or '',
-                    'type': ', '.join(paper.get('publicationTypes') or []) or 'article',
-                    'open_access': paper.get('isOpenAccess', False)
-                }
-                articles.append(article)
-            
-            return pd.DataFrame(articles)
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                st.warning("⚠️ Semantic Scholar: Trop de requêtes, réessayez dans quelques minutes")
-            else:
-                st.error(f"Erreur HTTP Semantic Scholar: {e}")
-            return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Erreur Semantic Scholar: {e}")
-            return pd.DataFrame()
-    
-    def _format_authors(self, authors: List[Dict]) -> str:
-        """Formater la liste des auteurs."""
-        author_names = []
-        for author in authors[:5]:  # Limiter à 5 auteurs
-            name = author.get('name', '')
-            if name:
-                author_names.append(name)
+        st.markdown("<br>", unsafe_allow_html=True)
         
-        result = '; '.join(author_names)
-        if len(authors) > 5:
-            result += ' et al.'
-        return result
-
-class PubMedAPI:
-    """Client pour l'API PubMed E-utilities."""
-    
-    def __init__(self):
-        self.base_url = API_CONFIG["pubmed"]["base_url"]
-        self.session = requests.Session()
-    
-    def search_articles(self, query: str, year_from: int, year_to: int, max_results: int = 100) -> pd.DataFrame:
-        """Rechercher des articles sur PubMed."""
-        try:
-            # Étape 1: Recherche des IDs
-            search_params = {
-                'db': 'pubmed',
-                'term': f'{query} AND {year_from}[PDAT]:{year_to}[PDAT]',
-                'retmax': min(max_results, 200),
-                'retmode': 'json',
-                'sort': 'relevance'
-            }
-            
-            search_response = self.session.get(f"{self.base_url}/esearch.fcgi", params=search_params)
-            search_response.raise_for_status()
-            search_data = search_response.json()
-            
-            pmids = search_data.get('esearchresult', {}).get('idlist', [])
-            
-            if not pmids:
-                return pd.DataFrame()
-            
-            # Étape 2: Récupération des détails
-            fetch_params = {
-                'db': 'pubmed',
-                'id': ','.join(pmids),
-                'retmode': 'xml'
-            }
-            
-            fetch_response = self.session.get(f"{self.base_url}/efetch.fcgi", params=fetch_params)
-            fetch_response.raise_for_status()
-            
-            articles = self._parse_pubmed_xml(fetch_response.text)
-            return pd.DataFrame(articles)
-            
-        except Exception as e:
-            st.error(f"Erreur PubMed: {e}")
-            return pd.DataFrame()
-    
-    def _parse_pubmed_xml(self, xml_text: str) -> List[Dict]:
-        """Parser le XML de PubMed."""
-        articles = []
-        try:
-            root = ET.fromstring(xml_text)
-            
-            for article_elem in root.findall('.//PubmedArticle'):
-                article_data = article_elem.find('.//Article')
-                if article_data is None:
-                    continue
-                
-                # Titre
-                title_elem = article_data.find('.//ArticleTitle')
-                title = title_elem.text if title_elem is not None else ''
-                
-                # Résumé
-                abstract_elem = article_data.find('.//Abstract/AbstractText')
-                abstract = abstract_elem.text if abstract_elem is not None else ''
-                
-                # Auteurs
-                authors = []
-                for author_elem in article_data.findall('.//AuthorList/Author'):
-                    lastname = author_elem.find('.//LastName')
-                    forename = author_elem.find('.//ForeName')
-                    if lastname is not None:
-                        name = lastname.text
-                        if forename is not None:
-                            name = f"{name}, {forename.text}"
-                        authors.append(name)
-                
-                # Journal
-                journal_elem = article_data.find('.//Journal/Title')
-                journal = journal_elem.text if journal_elem is not None else ''
-                
-                # Année
-                year_elem = article_data.find('.//PubDate/Year')
-                year = int(year_elem.text) if year_elem is not None else None
-                
-                # PMID
-                pmid_elem = article_elem.find('.//PMID')
-                pmid = pmid_elem.text if pmid_elem is not None else ''
-                
-                # DOI
-                doi = ''
-                for doi_elem in article_data.findall('.//ELocationID'):
-                    if doi_elem.get('EIdType') == 'doi':
-                        doi = doi_elem.text
-                        break
-                
-                article = {
-                    'source': 'PubMed',
-                    'title': title,
-                    'abstract': abstract,
-                    'authors': '; '.join(authors[:5]) + (' et al.' if len(authors) > 5 else ''),
-                    'journal': journal,
-                    'year': year,
-                    'doi': doi,
-                    'cited_by': 0,  # PubMed ne fournit pas directement le nombre de citations
-                    'url': f'https://pubmed.ncbi.nlm.nih.gov/{pmid}/' if pmid else '',
-                    'pmid': pmid,
-                    'type': 'Article'
-                }
-                articles.append(article)
-                
-        except ET.ParseError as e:
-            st.error(f"Erreur parsing XML PubMed: {e}")
+        username = st.text_input("👤 Nom d'utilisateur", placeholder="Entrez votre nom d'utilisateur")
+        password = st.text_input("🔒 Mot de passe", type="password", placeholder="Entrez votre mot de passe")
         
-        return articles
-
-class CrossrefAPI:
-    """Client pour l'API Crossref."""
-    
-    def __init__(self):
-        self.base_url = API_CONFIG["crossref"]["base_url"]
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'LitReviewPipeline/1.0 (mailto:user@example.com)'
-        })
-    
-    def search_works(self, query: str, year_from: int, year_to: int, max_results: int = 100) -> pd.DataFrame:
-        """Rechercher des articles sur Crossref."""
-        try:
-            params = {
-                'query': query,
-                'filter': f'from-pub-date:{year_from},until-pub-date:{year_to}',
-                'rows': min(max_results, 200),
-                'sort': 'relevance',
-                'order': 'desc'
-            }
-            
-            response = self.session.get(f"{self.base_url}/works", params=params)
-            response.raise_for_status()
-            
-            data = response.json()
-            articles = []
-            
-            for work in data.get('message', {}).get('items', []):
-                # Date de publication
-                pub_date = work.get('published-print', work.get('published-online', {}))
-                year = None
-                if pub_date and 'date-parts' in pub_date:
-                    year = pub_date['date-parts'][0][0] if pub_date['date-parts'][0] else None
-                
-                article = {
-                    'source': 'Crossref',
-                    'title': ' '.join(work.get('title', [])),
-                    'abstract': work.get('abstract', ''),
-                    'authors': self._format_authors(work.get('author', [])),
-                    'journal': work.get('container-title', [''])[0],
-                    'year': year,
-                    'doi': work.get('DOI', ''),
-                    'cited_by': work.get('is-referenced-by-count', 0),
-                    'url': work.get('URL', ''),
-                    'type': work.get('type', ''),
-                    'open_access': 'license' in work
-                }
-                articles.append(article)
-            
-            return pd.DataFrame(articles)
-            
-        except Exception as e:
-            st.error(f"Erreur Crossref: {e}")
-            return pd.DataFrame()
-    
-    def _format_authors(self, authors: List[Dict]) -> str:
-        """Formater la liste des auteurs."""
-        author_names = []
-        for author in authors[:5]:  # Limiter à 5 auteurs
-            given = author.get('given', '')
-            family = author.get('family', '')
-            if family:
-                name = f"{family}, {given}" if given else family
-                author_names.append(name)
+        col_check, col_btn = st.columns([1, 1])
+        with col_check:
+            remember = st.checkbox("🔄 Se souvenir de moi", help="Garde la session active plus longtemps")
         
-        result = '; '.join(author_names)
-        if len(authors) > 5:
-            result += ' et al.'
-        return result
-
-def create_extended_columns():
-    """Créer les colonnes étendues pour l'analyse bibliographique."""
-    return {
-        'ABS 1 OU 0': '',
-        'Notes': '', 
-        'Type revue': '',
-        'WL = mesure': '',
-        'Chr = participants': '',
-        'Spécialité': '',
-        'Intervention': '',
-        'Technique': '',
-        'Contexte': '',
-        'Simulation ?': '',
-        'Outils': '',
-        'Résultats ?': '',
-        'Additional outcomes / measures': '',
-        'Exclusion': ''
-    }
-
-def detect_review_type(title):
-    """Détecter le type de revue à partir du titre."""
-    if pd.isna(title):
-        return ''
+        with col_btn:
+            if st.button("🚀 Se connecter", type="primary", use_container_width=True):
+                if username and password:
+                    if check_user(username, password):
+                        st.session_state["logged_in"] = True
+                        st.session_state["username"] = username
+                        st.session_state["remember_login"] = remember
+                        st.session_state["login_time"] = datetime.now()
+                        
+                        # Configurer la persistance si demandée
+                        if remember:
+                            set_persistent_login(username)
+                        
+                        st.success("✅ Connexion réussie !")
+                        time.sleep(1)  # Pause pour voir le message
+                        st.rerun()
+                    else:
+                        st.error("❌ Identifiants incorrects")
+                else:
+                    st.warning("⚠️ Veuillez remplir tous les champs")
     
-    title_lower = str(title).lower()
-    
-    if 'systematic review' in title_lower or 'systematic literature review' in title_lower:
-        return 'Revue systématique'
-    elif 'meta-analysis' in title_lower or 'meta analysis' in title_lower:
-        return 'Méta-analyse'
-    elif 'scoping review' in title_lower:
-        return 'Scoping review'
-    elif 'narrative review' in title_lower:
-        return 'Revue narrative'
-    elif 'randomized controlled trial' in title_lower or 'rct' in title_lower:
-        return 'ECR'
-    elif 'cohort study' in title_lower:
-        return 'Étude de cohorte'
-    elif 'case study' in title_lower or 'case report' in title_lower:
-        return 'Étude de cas'
-    elif 'cross-sectional' in title_lower:
-        return 'Étude transversale'
+    st.stop()
+
+# === APP PRINCIPALE ===
+# Header avec info utilisateur et bouton déconnexion
+col_user1, col_user2, col_user3 = st.columns([2, 1, 1])
+
+with col_user1:
+    login_duration = datetime.now() - st.session_state["login_time"] if st.session_state["login_time"] else timedelta(0)
+    duration_str = str(login_duration).split('.')[0]
+    st.success(f"👋 Bonjour **{st.session_state['username']}** • ⏱️ Connecté depuis {duration_str}")
+
+with col_user2:
+    if st.session_state.get("remember_login", False):
+        st.info("🔄 Session mémorisée")
     else:
-        return ''
+        st.warning("⚠️ Session temporaire")
 
-def detect_specialty(journal):
-    """Détecter la spécialité médicale à partir du nom du journal."""
-    if pd.isna(journal):
-        return ''
+with col_user3:
+    if st.button("🚪 Se déconnecter", type="secondary", help="Déconnexion et nettoyage de la session"):
+        logout_user()
+        st.success("👋 À bientôt !")
+        time.sleep(1)
+        st.rerun()
+
+# Charger data depuis la BDD directement
+df_db = fetch_articles_from_db()
+
+# Upload Excel en plus (optionnel)
+uploaded_file = st.file_uploader("📂 Importez un fichier Excel (optionnel)", type=["xlsx","xlsm"])
+if uploaded_file:
+    df = pd.read_excel(uploaded_file, engine="openpyxl")
+    df["vote_status"] = "pending"
+    st.session_state["excel_data"] = df
+else:
+    df = st.session_state.get("excel_data", None)
+
+# Tri interactif si Excel chargé
+if df is not None and len(df[df["vote_status"]=="pending"])>0:
+    column_mapping = smart_column_mapping(df)
+    pending = df[df["vote_status"]=="pending"].reset_index()
+
+    # Navigation et mots-clés
+    col_nav1, col_nav2 = st.columns([2, 1])
+    with col_nav1:
+        keywords_input = st.text_input("🔍 Mots-clés à surligner", "")
+        keywords = [k.strip() for k in keywords_input.split(",") if k.strip()]
     
-    journal_lower = str(journal).lower()
+    with col_nav2:
+        total_pending = len(pending)
+        current_index = st.session_state.get("triage_index", 0)
+        
+        # Input pour aller directement à un article
+        target_article = st.number_input(
+            f"📍 Aller à l'article (1-{total_pending})",
+            min_value=1,
+            max_value=total_pending,
+            value=current_index + 1,
+            key="article_navigator"
+        )
+        
+        if st.button("📍 Y aller"):
+            st.session_state["triage_index"] = target_article - 1
+            st.rerun()
+
+    cur = st.session_state.get("triage_index", 0)
     
-    # Dictionnaire de spécialités basé sur les mots-clés du journal
-    specialties = {
-        'psychiatry': 'Psychiatrie',
-        'psychology': 'Psychologie',
-        'mental health': 'Santé mentale',
-        'surgery': 'Chirurgie',
-        'anesthesi': 'Anesthésie',
-        'cardiology': 'Cardiologie',
-        'neurology': 'Neurologie',
-        'oncology': 'Oncologie',
-        'pediatric': 'Pédiatrie',
-        'emergency': 'Urgences',
-        'intensive care': 'Soins intensifs',
-        'radiology': 'Radiologie',
-        'orthopedic': 'Orthopédie',
-        'dermatology': 'Dermatologie',
-        'ophthalmology': 'Ophtalmologie',
-        'otolaryngology': 'ORL',
-        'urology': 'Urologie',
-        'gynecology': 'Gynécologie',
-        'nursing': 'Soins infirmiers',
-        'rehabilitation': 'Rééducation',
-        'pharmacology': 'Pharmacologie'
+    # S'assurer qu'on ne dépasse pas le nombre d'articles disponibles
+    if cur >= len(pending):
+        cur = 0
+        st.session_state["triage_index"] = 0
+    row = pending.iloc[cur]
+    idx = int(row["index"])
+    current_article = df.loc[idx]
+
+    art_data = {
+        "title": get_article_field(current_article,"title",column_mapping,"Sans titre"),
+        "abstract": get_article_field(current_article,"abstract",column_mapping,"Résumé non dispo"),
+        "authors": get_article_field(current_article,"authors",column_mapping,"Auteurs inconnus"),
+        "journal": get_article_field(current_article,"journal",column_mapping,"Journal inconnu"),
+        "year": safe_year_conversion(get_article_field(current_article,"year",column_mapping,"")),
+        "doi": get_article_field(current_article,"doi",column_mapping,"DOI non dispo"),
+        "url": get_article_field(current_article,"url",column_mapping,""),
+        "issn": get_article_field(current_article,"issn",column_mapping,""),
+        "abs_lo_uo": get_article_field(current_article,"abs_lo_uo",column_mapping,""),
+        "notes": get_article_field(current_article,"notes",column_mapping,""),
+        "type_revue": get_article_field(current_article,"type_revue",column_mapping,""),
+        "wl_mesure": get_article_field(current_article,"wl_mesure",column_mapping,""),
+        "chir_participants": get_article_field(current_article,"chir_participants",column_mapping,""),
+        "specialiste": get_article_field(current_article,"specialiste",column_mapping,""),
+        "intervention": get_article_field(current_article,"intervention",column_mapping,""),
+        "technique": get_article_field(current_article,"technique",column_mapping,""),
+        "contexte": get_article_field(current_article,"contexte",column_mapping,""),
+        "simulation": get_article_field(current_article,"simulation",column_mapping,""),
+        "additional_outcomes": get_article_field(current_article,"additional_outcomes",column_mapping,"")
     }
-    
-    for keyword, specialty in specialties.items():
-        if keyword in journal_lower:
-            return specialty
-    
-    return ''
 
-def main():
-    """Application principale."""
-    st.set_page_config(
-        page_title="Recherche Bibliographique Avancée",
-        page_icon="🔬",
-        layout="wide"
-    )
-    
-    st.title("🔬 Recherche Bibliographique Avancée")
-    st.markdown("**Vraies APIs scientifiques + Customisation Excel complète**")
-    
-    # Tabs pour les différentes fonctionnalités
-    tab1, tab2, tab3 = st.tabs([
-        "🔎 Recherche Multi-API", 
-        "📊 Import & Customisation Excel",
-        "⚙️ Configuration APIs"
-    ])
-    
-    with tab1:
-        st.header("🔎 Recherche avec APIs Réelles")
-        recherche_multi_api()
-    
-    with tab2:
-        st.header("📊 Customisation Excel Avancée")
-        customisation_excel()
-    
-    with tab3:
-        st.header("⚙️ Configuration des APIs")
-        configuration_apis()
+    for k,v in art_data.items():
+        art_data[k] = highlight_text(v, keywords)
 
-def recherche_multi_api():
-    """Interface pour la recherche avec vraies APIs."""
-    
-    # Configuration dans la sidebar
-    st.sidebar.header("🔬 Configuration Recherche")
-    
-    # Paramètres de recherche
-    query = st.sidebar.text_area(
-        "Requête de recherche",
-        value="machine learning healthcare",
-        help="Mots-clés en anglais. Exemples: 'covid vaccine', 'cancer therapy', 'AI diagnosis'"
-    )
-    
-    # Plage d'années
-    col1, col2 = st.sidebar.columns(2)
+    # Affichage de la progression
+    progress_pct = (cur + 1) / len(df)
+    st.markdown(f"### Article {cur+1}/{len(df)}")
+    st.progress(progress_pct, text=f"Progression du tri: {cur+1}/{len(df)} ({progress_pct:.1%})")
+
+    st.markdown(f"""
+    <div class="article-card">
+      <h3 class="card-title">📄 {art_data['title']}</h3>
+      <div class="meta-item"><div class="meta-label">👥 Auteurs</div><div class="meta-value">{art_data['authors']}</div></div>
+      <div class="meta-item"><div class="meta-label">📚 Journal</div><div class="meta-value">{art_data['journal']}</div></div>
+      <div class="meta-item"><div class="meta-label">📅 Année</div><div class="meta-value">{art_data['year']}</div></div>
+      <div class="meta-item"><div class="meta-label">🔗 DOI</div><div class="meta-value">{art_data['doi']}</div></div>
+      {f'<div class="meta-item"><div class="meta-label">🌍 URL</div><div class="meta-value"><a href="{art_data["url"]}" target="_blank">{art_data["url"]}</a></div></div>' if art_data["url"] else ""}
+      <div class="abstract-section"><strong>📝 Résumé</strong><br><br>{art_data['abstract']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns(3)
     with col1:
-        year_from = st.number_input("Année début", 2018, 2024, 2022)
+        if st.button("🗑️ REJETER"):
+            df.at[idx,"vote_status"]="reject"
+            insert_article_in_db(art_data,"reject",st.session_state["username"])
+            st.session_state["triage_index"]=cur+1
+            st.rerun()
     with col2:
-        year_to = st.number_input("Année fin", 2018, 2024, 2024)
-    
-    max_results = st.sidebar.slider("Articles par API", 10, 200, 50)
-    
-    # Sélection des APIs
-    st.sidebar.subheader("📚 APIs Scientifiques")
-    
-    use_openalex = st.sidebar.checkbox("🌐 OpenAlex (Gratuit)", value=True, 
-                                       help="Base de données bibliographique open source")
-    use_semantic = st.sidebar.checkbox("🧠 Semantic Scholar (Gratuit)", value=True,
-                                       help="Moteur de recherche académique avec IA")
-    use_pubmed = st.sidebar.checkbox("🏥 PubMed (Gratuit)", value=False,
-                                     help="Base biomédicale officielle NCBI")
-    use_crossref = st.sidebar.checkbox("📄 Crossref (Gratuit)", value=False,
-                                       help="Métadonnées d'articles académiques")
-    
-    # Bouton de recherche
-    if st.sidebar.button("🚀 Lancer Recherche Multi-API", type="primary"):
-        if not query.strip():
-            st.error("⚠️ Veuillez saisir une requête de recherche")
-            return
-        
-        # Affichage des paramètres
-        st.subheader("📋 Paramètres de Recherche")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.info(f"**Requête:** {query}")
-        with col2:
-            st.info(f"**Période:** {year_from}-{year_to}")
-        with col3:
-            apis_selected = sum([use_openalex, use_semantic, use_pubmed, use_crossref])
-            st.info(f"**APIs:** {apis_selected} sélectionnées")
-        
-        # Progress tracking
-        all_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        apis_to_run = []
-        if use_openalex: apis_to_run.append(("OpenAlex", OpenAlexAPI))
-        if use_semantic: apis_to_run.append(("Semantic Scholar", SemanticScholarAPI))
-        if use_pubmed: apis_to_run.append(("PubMed", PubMedAPI))
-        if use_crossref: apis_to_run.append(("Crossref", CrossrefAPI))
-        
-        for i, (api_name, api_class) in enumerate(apis_to_run):
-            status_text.text(f"🔍 Recherche sur {api_name}...")
-            progress = (i + 0.5) / len(apis_to_run)
-            progress_bar.progress(progress)
-            
-            try:
-                api_client = api_class()
-                
-                if api_name == "OpenAlex":
-                    df = api_client.search_works(query, year_from, year_to, max_results)
-                elif api_name == "Semantic Scholar":
-                    df = api_client.search_papers(query, year_from, year_to, max_results)
-                elif api_name == "PubMed":
-                    df = api_client.search_articles(query, year_from, year_to, max_results)
-                elif api_name == "Crossref":
-                    df = api_client.search_works(query, year_from, year_to, max_results)
-                
-                if not df.empty:
-                    all_results.append(df)
-                    st.success(f"✅ {api_name}: {len(df)} articles")
-                else:
-                    st.warning(f"⚠️ {api_name}: Aucun résultat")
-                
-                # Délai pour respecter les limites de taux
-                time.sleep(0.5)
-                
-            except Exception as e:
-                st.error(f"❌ Erreur {api_name}: {e}")
-            
-            progress = (i + 1) / len(apis_to_run)
-            progress_bar.progress(progress)
-        
-        # Fusion des résultats
-        if all_results:
-            status_text.text("🔄 Fusion des résultats...")
-            combined_df = pd.concat(all_results, ignore_index=True)
-            
-            # Déduplication basique par titre
-            combined_df = combined_df.drop_duplicates(subset=['title'], keep='first')
-            
-            st.session_state['search_results'] = combined_df
-            progress_bar.progress(1.0)
-            status_text.text("✅ Recherche terminée!")
-            
-            st.success(f"🎉 **Total: {len(combined_df)} articles uniques trouvés**")
-        else:
-            st.error("❌ Aucun résultat trouvé sur les APIs sélectionnées")
-    
-    # Affichage des résultats
-    if 'search_results' in st.session_state:
-        df = st.session_state['search_results']
-        
-        st.subheader(f"📊 Résultats ({len(df)} articles)")
-        
-        # Statistiques
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Articles", len(df))
-        with col2:
-            sources = df['source'].nunique()
-            st.metric("Sources", sources)
-        with col3:
-            with_abstract = (df['abstract'] != "").sum()
-            st.metric("Avec résumé", with_abstract)
-        with col4:
-            total_citations = df['cited_by'].sum()
-            st.metric("Citations", total_citations)
-        
-        # Filtres
-        col1, col2 = st.columns(2)
-        with col1:
-            sources_filter = st.multiselect(
-                "Filtrer par source",
-                options=df['source'].unique(),
-                default=df['source'].unique()
-            )
-        with col2:
-            if 'year' in df.columns:
-                years = sorted([y for y in df['year'].unique() if pd.notna(y)])
-                if years:
-                    year_range = st.select_slider(
-                        "Plage d'années",
-                        options=years,
-                        value=(min(years), max(years))
-                    )
-        
-        # Application des filtres
-        filtered_df = df[df['source'].isin(sources_filter)]
-        if 'year_range' in locals() and 'year' in filtered_df.columns:
-            filtered_df = filtered_df[
-                (filtered_df['year'] >= year_range[0]) & 
-                (filtered_df['year'] <= year_range[1])
-            ]
-        
-        # Affichage du tableau
-        display_columns = ['title', 'authors', 'journal', 'year', 'source', 'cited_by']
-        display_df = filtered_df[display_columns].copy()
-        
-        # Tronquer les titres longs
-        display_df['title'] = display_df['title'].apply(
-            lambda x: x[:80] + "..." if len(str(x)) > 80 else x
-        )
-        
-        st.dataframe(display_df, use_container_width=True)
-        
-        # Export vers customisation
-        if st.button("📊 Envoyer vers Customisation Excel", type="secondary"):
-            st.session_state['excel_data'] = filtered_df
-            st.success("✅ Données envoyées vers l'onglet Customisation Excel!")
+        if st.button("⏸️ METTRE DE CÔTÉ"):
+            df.at[idx,"vote_status"]="aside"
+            insert_article_in_db(art_data,"aside",st.session_state["username"])
+            st.session_state["triage_index"]=cur+1
+            st.rerun()
+    with col3:
+        if st.button("✅ GARDER"):
+            df.at[idx,"vote_status"]="accept"
+            insert_article_in_db(art_data,"accept",st.session_state["username"])
+            st.session_state["triage_index"]=cur+1
+            st.rerun()
 
-def customisation_excel():
-    """Interface pour la customisation Excel avancée."""
-    
-    st.markdown("""
-    **Importez un fichier Excel OU utilisez les résultats de recherche**
-    
-    Fonctionnalités :
-    - 📁 Import Excel
-    - ✏️ Édition en ligne 
-    - 🗑️ Suppression de lignes
-    - 📝 Ajout de colonnes d'analyse
-    - 💾 Export personnalisé
-    """)
-    
-    # Options d'import
-    tab1, tab2 = st.tabs(["📁 Import Fichier", "📊 Données de Recherche"])
-    
-    with tab1:
-        # Guide rapide pour l'utilisateur
-        with st.expander("💡 Guide: Préparer votre fichier Excel"):
-            st.markdown("""
-            **📋 Colonnes recommandées pour votre fichier Excel:**
+# Toujours afficher les résultats depuis la BDD
+st.subheader("📊 Résultats enregistrés en base")
+
+if not df_db.empty:
+    kept = df_db[df_db["status"]=="accept"]
+    rejected = df_db[df_db["status"]=="reject"]
+    aside = df_db[df_db["status"]=="aside"]
+
+    # Fonction pour gérer les modifications d'un tableau
+    def handle_table_edits(edited_df, original_df, status_name):
+        if not edited_df.equals(original_df):
+            st.success(f"📝 Modifications détectées dans {status_name}")
             
-            **🔬 Métadonnées principales:**
-            - `title` : Titre de l'article
-            - `authors` : Auteurs
-            - `journal` : Journal/Revue
-            - `year` : Année de publication
-            - `abstract` : Résumé
-            - `doi` : Identifiant DOI
-            
-            **📊 Colonnes d'analyse (optionnelles):**
-            - `ABS 1 OU 0` : Présence résumé (1=oui, 0=non)
-            - `Notes` : Notes personnelles
-            - `Type revue` : Type d'étude
-            - `WL = mesure` : Mesures/outcomes
-            - `Chr = participants` : Caractéristiques participants
-            - `Spécialité` : Domaine médical
-            - `Intervention` : Type d'intervention
-            - `Technique` : Technique utilisée
-            - `Contexte` : Contexte de l'étude
-            - `Simulation ?` : Utilise simulation (Oui/Non)
-            - `Outils` : Outils utilisés
-            - `Résultats ?` : Type de résultats
-            - `Additional outcomes / measures` : Mesures additionnelles
-            - `Exclusion` : Statut inclusion/exclusion
-            
-            **✅ L'application détecte automatiquement les variations de noms !**
-            """)
+            # Comparer ligne par ligne pour identifier les changements
+            for idx in range(len(edited_df)):
+                if idx < len(original_df):
+                    original_row = original_df.iloc[idx]
+                    edited_row = edited_df.iloc[idx]
+                    
+                    # Si c'est une ligne modifiée
+                    if not edited_row.equals(original_row):
+                        # Récupérer l'ID directement depuis la colonne ID du tableau édité
+                        if "ID" in edited_df.columns:
+                            article_id = edited_row["ID"]
+                        else:
+                            st.error("Impossible de trouver l'ID de l'article")
+                            continue
+                        
+                        # Préparer les données à mettre à jour (mapping inverse)
+                        update_data = {}
+                        column_mapping_reverse = {
+                            "Article Public Author Title": "title",
+                            "Journal": "journal",
+                            "ISSN": "issn",
+                            "DOI": "doi",
+                            "URL": "url",
+                            "Abstract Note": "abstract",
+                            "ABS LO UO": "abs_lo_uo",
+                            "Notes": "notes",
+                            "Type revue": "type_revue",
+                            "WL = mesure": "wl_mesure",
+                            "Chir = participants": "chir_participants",
+                            "Specialiste": "specialiste",
+                            "Intervention": "intervention",
+                            "Technique": "technique",
+                            "Contexte": "contexte",
+                            "Simulation": "simulation",
+                            "additional outcomes / exclusion": "additional_outcomes"
+                        }
+                        
+                        for display_col, db_col in column_mapping_reverse.items():
+                            if display_col in edited_df.columns:
+                                update_data[db_col] = edited_row[display_col]
+                        
+                        # Mettre à jour en base
+                        try:
+                            update_article_in_db(article_id, update_data)
+                            st.toast(f"✅ Article ID {article_id} mis à jour", icon="✅")
+                        except Exception as e:
+                            st.error(f"Erreur lors de la mise à jour de l'article ID {article_id}: {e}")
+
+    st.markdown("### ✅ Conservés")
+    if len(kept) > 0:
+        kept_display = format_display_columns(kept)
         
-        uploaded_file = st.file_uploader(
-            "Choisir un fichier Excel",
-            type=['xlsx', 'xls', 'xlsm'],
-            help="Formats supportés: .xlsx, .xls, .xlsm (avec macros)"
+        # Configuration des colonnes - ID en lecture seule
+        column_config = {}
+        if "ID" in kept_display.columns:
+            column_config["ID"] = st.column_config.NumberColumn(
+                "ID",
+                help="ID unique de l'article (non modifiable)",
+                disabled=True,
+                width="small"
+            )
+        
+        edited_kept = st.data_editor(
+            kept_display, 
+            use_container_width=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key="kept_editor"
         )
+        handle_table_edits(edited_kept, kept_display, "articles conservés")
+    else:
+        st.info("Aucun article conservé.")
+
+    st.markdown("### ❌ Rejetés")
+    if len(rejected) > 0:
+        rejected_display = format_display_columns(rejected)
         
-        if uploaded_file:
-            # Afficher les informations du fichier
-            file_details = {
-                "Nom": uploaded_file.name,
-                "Taille": f"{uploaded_file.size / 1024:.1f} KB",
-                "Type": uploaded_file.type
+        # Configuration des colonnes - ID en lecture seule
+        column_config = {}
+        if "ID" in rejected_display.columns:
+            column_config["ID"] = st.column_config.NumberColumn(
+                "ID",
+                help="ID unique de l'article (non modifiable)",
+                disabled=True,
+                width="small"
+            )
+        
+        edited_rejected = st.data_editor(
+            rejected_display, 
+            use_container_width=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key="rejected_editor"
+        )
+        handle_table_edits(edited_rejected, rejected_display, "articles rejetés")
+    else:
+        st.info("Aucun article rejeté.")
+
+    st.markdown("### ⏸️ Mis de côté")
+    if len(aside) > 0:
+        aside_display = format_display_columns(aside)
+        
+        # Configuration des colonnes - ID en lecture seule
+        column_config = {}
+        if "ID" in aside_display.columns:
+            column_config["ID"] = st.column_config.NumberColumn(
+                "ID",
+                help="ID unique de l'article (non modifiable)",
+                disabled=True,
+                width="small"
+            )
+        
+        edited_aside = st.data_editor(
+            aside_display, 
+            use_container_width=True,
+            num_rows="fixed",
+            column_config=column_config,
+            key="aside_editor"
+        )
+        handle_table_edits(edited_aside, aside_display, "articles mis de côté")
+    else:
+        st.info("Aucun article mis de côté.")
+
+    # Boutons d'export (utilisent les données actuelles de la base)
+    st.markdown("### 📤 Export")
+    col_exp = st.columns(3)
+    with col_exp[0]:
+        if len(kept)>0: 
+            export_excel(kept, "articles_conserves")
+    with col_exp[1]:
+        if len(rejected)>0: 
+            export_excel(rejected, "articles_supprimes")
+    with col_exp[2]:
+        if len(aside)>0: 
+            export_excel(aside, "articles_mis_de_cote")
+    
+    if st.button("🔄 Actualiser les données"):
+        st.rerun()
+else:
+    st.info("Aucun article trié en base de données.")
+
+# === SECTION STATISTIQUES ===
+if not df_db.empty:
+    st.markdown("---")
+    st.markdown("### 📊 Statistiques et Analytics")
+    
+    # Préparer les données
+    df_stats = df_db.copy()
+    
+    # Convertir date_action en datetime si ce n'est pas déjà fait
+    if 'date_action' in df_stats.columns:
+        df_stats['date_action'] = pd.to_datetime(df_stats['date_action'])
+        df_stats['date_only'] = df_stats['date_action'].dt.date
+    
+    # Créer 3 colonnes pour les métriques principales
+    col_metric1, col_metric2, col_metric3, col_metric4 = st.columns(4)
+    
+    total_articles = len(df_stats)
+    kept_count = len(df_stats[df_stats['status'] == 'accept'])
+    rejected_count = len(df_stats[df_stats['status'] == 'reject'])
+    aside_count = len(df_stats[df_stats['status'] == 'aside'])
+    
+    with col_metric1:
+        st.metric("📚 Total Articles", total_articles)
+    with col_metric2:
+        st.metric("✅ Conservés", kept_count, f"{kept_count/total_articles*100:.1f}%")
+    with col_metric3:
+        st.metric("❌ Rejetés", rejected_count, f"{rejected_count/total_articles*100:.1f}%")
+    with col_metric4:
+        st.metric("⏸️ En attente", aside_count, f"{aside_count/total_articles*100:.1f}%")
+    
+    # Ligne 1: Distribution des statuts + Évolution temporelle
+    col_chart1, col_chart2 = st.columns(2)
+    
+    with col_chart1:
+        st.markdown("#### 🥧 Répartition par statut")
+        status_counts = df_stats['status'].value_counts()
+        status_mapping = {'accept': 'Conservés', 'reject': 'Rejetés', 'aside': 'Mis de côté'}
+        
+        fig_pie = px.pie(
+            values=status_counts.values,
+            names=[status_mapping.get(x, x) for x in status_counts.index],
+            color_discrete_map={
+                'Conservés': '#00e1c6',
+                'Rejetés': '#ff6b6b', 
+                'Mis de côté': '#ffd93d'
             }
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.info(f"📄 **{file_details['Nom']}**")
-            with col2:
-                st.info(f"💾 **{file_details['Taille']}**")
-            with col3:
-                st.info(f"📝 **{file_details['Type'].split('.')[-1].upper()}**")
-            
-            try:
-                # Lecture du fichier Excel avec gestion robuste
-                df = pd.read_excel(uploaded_file, engine='openpyxl')
-                
-                # Détection des colonnes d'analyse existantes avec variations de noms
-                analysis_columns = ['ABS 1 OU 0', 'Notes', 'Type revue', 'WL = mesure', 'Chr = participants', 
-                                  'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Simulation ?', 
-                                  'Outils', 'Résultats ?', 'Additional outcomes / measures', 'Exclusion']
-                
-                # Normaliser les noms de colonnes pour la détection
-                df_columns_lower = [col.lower().strip() for col in df.columns]
-                analysis_columns_lower = [col.lower().strip() for col in analysis_columns]
-                
-                # Détecter les colonnes avec variations de noms
-                existing_analysis_cols = []
-                column_mapping = {}
-                
-                for target_col in analysis_columns:
-                    target_lower = target_col.lower().strip()
-                    
-                    # Recherche exacte d'abord
-                    if target_col in df.columns:
-                        existing_analysis_cols.append(target_col)
-                        column_mapping[target_col] = target_col
-                    else:
-                        # Recherche avec variations (case insensitive, espaces)
-                        for df_col in df.columns:
-                            df_col_clean = df_col.lower().strip()
-                            
-                            # Vérifications avec différentes variations
-                            if (df_col_clean == target_lower or 
-                                df_col_clean.replace(' ', '') == target_lower.replace(' ', '') or
-                                df_col_clean.replace('ou', 'OU').replace('?', ' ?') == target_lower):
-                                
-                                existing_analysis_cols.append(target_col)
-                                column_mapping[target_col] = df_col
-                                break
-                
-                # Renommer les colonnes pour standardiser
-                if column_mapping:
-                    rename_dict = {v: k for k, v in column_mapping.items() if v != k}
-                    if rename_dict:
-                        df = df.rename(columns=rename_dict)
-                        st.info(f"🔄 {len(rename_dict)} colonne(s) renommée(s) pour standardisation: {', '.join(rename_dict.keys())}")
-                
-                missing_analysis_cols = [col for col in analysis_columns if col not in existing_analysis_cols]
-                
-                # Affichage des informations sur les colonnes
-                col1, col2 = st.columns(2)
-                with col1:
-                    if existing_analysis_cols:
-                        st.success(f"✅ **{len(existing_analysis_cols)} colonnes d'analyse détectées:**")
-                        for col in existing_analysis_cols:
-                            filled_count = (df[col].astype(str).str.strip() != '').sum()
-                            st.caption(f"• {col}: {filled_count} entrées")
-                    else:
-                        st.info("ℹ️ Aucune colonne d'analyse détectée")
-                
-                with col2:
-                    if missing_analysis_cols:
-                        st.warning(f"⚠️ **{len(missing_analysis_cols)} colonnes d'analyse manquantes:**")
-                        st.caption(", ".join(missing_analysis_cols[:3]) + ("..." if len(missing_analysis_cols) > 3 else ""))
-                
-                # Ajouter automatiquement les colonnes d'analyse si l'option est activée
-                if st.session_state.get('auto_add_columns', False):
-                    extended_columns = create_extended_columns()
-                    added_count = 0
-                    for col_name, default_value in extended_columns.items():
-                        if col_name not in df.columns:
-                            df[col_name] = default_value
-                            added_count += 1
-                    
-                    # Pré-remplissage automatique
-                    if 'abstract' in df.columns and 'ABS 1 OU 0' in df.columns:
-                        df['ABS 1 OU 0'] = df['abstract'].apply(
-                            lambda x: '1' if pd.notna(x) and str(x).strip() != '' else '0'
-                        )
-                    
-                    if added_count > 0:
-                        st.success(f"🚀 {added_count} nouvelles colonnes d'analyse ajoutées automatiquement!")
-                
-                st.session_state['excel_data'] = df
-                st.success(f"✅ Fichier importé avec succès: {len(df)} lignes, {len(df.columns)} colonnes")
-                
-                # Afficher quelques colonnes détectées pour confirmation
-                basic_cols = ['title', 'authors', 'journal', 'year', 'abstract']
-                detected_basic = [col for col in basic_cols if col in df.columns]
-                if detected_basic:
-                    st.info(f"📊 Colonnes principales détectées: {', '.join(detected_basic)}")
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "No sheet named" in error_msg:
-                    st.error("❌ Erreur: Impossible de lire la feuille Excel. Vérifiez que le fichier n'est pas corrompu.")
-                elif "Unsupported format" in error_msg:
-                    st.error("❌ Erreur: Format de fichier non supporté. Utilisez .xlsx, .xls ou .xlsm")
-                elif "Permission denied" in error_msg:
-                    st.error("❌ Erreur: Fichier ouvert dans Excel. Fermez le fichier et réessayez.")
-                else:
-                    st.error(f"❌ Erreur lors de l'import: {error_msg}")
-                    st.info("💡 Conseil: Assurez-vous que votre fichier Excel est bien formaté et fermé dans Excel.")
-    
-    with tab2:
-        if 'search_results' in st.session_state:
-            if st.button("📊 Utiliser résultats de recherche"):
-                st.session_state['excel_data'] = st.session_state['search_results']
-                st.success("✅ Résultats de recherche chargés!")
-        else:
-            st.info("Effectuez d'abord une recherche dans l'onglet 'Recherche Multi-API'")
-    
-    # Interface de customisation
-    if 'excel_data' in st.session_state:
-        df = st.session_state['excel_data'].copy()
-        
-        st.subheader("📝 Customisation des Données")
-        
-        # Aperçu des données
-        st.write(f"**Données actuelles:** {len(df)} lignes, {len(df.columns)} colonnes")
-        
-        # Options de customisation
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("📊 Ajouter colonnes d'analyse", type="secondary"):
-                extended_columns = create_extended_columns()
-                for col_name, default_value in extended_columns.items():
-                    if col_name not in df.columns:
-                        df[col_name] = default_value
-                
-                # Pré-remplissage automatique intelligent
-                if 'abstract' in df.columns:
-                    df['ABS 1 OU 0'] = df['abstract'].apply(
-                        lambda x: '1' if pd.notna(x) and str(x).strip() != '' else '0'
-                    )
-                
-                # Auto-détecter le type de revue basé sur le titre
-                if 'title' in df.columns:
-                    df['Type revue'] = df['title'].apply(detect_review_type)
-                
-                # Auto-détecter la spécialité basée sur le journal
-                if 'journal' in df.columns:
-                    df['Spécialité'] = df['journal'].apply(detect_specialty)
-                
-                st.session_state['excel_data'] = df
-                st.success("✅ Colonnes d'analyse ajoutées avec pré-remplissage automatique!")
-                st.rerun()
-            
-            # Bouton pour ajouter automatiquement TOUTES les colonnes à l'import
-            if st.button("🚀 Auto-ajouter colonnes au chargement", type="primary"):
-                st.session_state['auto_add_columns'] = True
-                st.success("✅ Les colonnes d'analyse seront automatiquement ajoutées lors du prochain import!")
-                st.rerun()
-        
-        with col2:
-            if st.button("🔄 Réinitialiser données"):
-                if 'search_results' in st.session_state:
-                    st.session_state['excel_data'] = st.session_state['search_results'].copy()
-                st.success("✅ Données réinitialisées!")
-                st.rerun()
-        
-        with col3:
-            show_all_columns = st.checkbox("Afficher toutes les colonnes", value=False)
-        
-        # Sélection des colonnes à afficher
-        if show_all_columns:
-            columns_to_show = df.columns.tolist()
-        else:
-            default_columns = ['title', 'authors', 'journal', 'year', 'source']
-            available_defaults = [col for col in default_columns if col in df.columns]
-            columns_to_show = st.multiselect(
-                "Colonnes à afficher",
-                options=df.columns.tolist(),
-                default=available_defaults
-            )
-        
-        if columns_to_show:
-            display_df = df[columns_to_show].copy()
-            
-            # Interface de tableau scrollable pour l'édition
-            st.subheader("📊 Tableau d'Édition - Tous les Articles")
-            
-            # Affichage du nombre total d'articles
-            st.info(f"📊 **{len(df)} articles** à traiter | ✏️ Cliquez directement sur les cellules pour les modifier")
-            
-            # S'assurer que toutes les colonnes d'analyse existent
-            analysis_columns = ['ABS 1 OU 0', 'Notes', 'Type revue', 'WL = mesure', 'Chr = participants', 
-                              'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Simulation ?', 
-                              'Outils', 'Résultats ?', 'Additional outcomes / measures', 'Exclusion']
-            
-            current_df = st.session_state['excel_data']
-            
-            # Ajouter les colonnes d'analyse si elles n'existent pas
-            for col in analysis_columns:
-                if col not in current_df.columns:
-                    current_df[col] = ""
-            
-            # Configuration des colonnes éditables
-            column_config = {}
-            
-            # Configuration pour les colonnes d'analyse spécialisées
-            column_config['ABS 1 OU 0'] = st.column_config.SelectboxColumn(
-                "ABS 1 OU 0",
-                help="1 = Résumé présent, 0 = Pas de résumé",
-                options=['', '0', '1'],
-                default=''
-            )
-            
-            column_config['Simulation ?'] = st.column_config.SelectboxColumn(
-                "Simulation ?",
-                options=['', 'Oui', 'Non'],
-                default=''
-            )
-            
-            column_config['Type revue'] = st.column_config.SelectboxColumn(
-                "Type revue",
-                options=['', 'Revue systématique', 'Méta-analyse', 'ECR', 'Étude de cohorte', 'Étude de cas', 'Revue narrative', 'Autre'],
-                default=''
-            )
-            
-            column_config['Résultats ?'] = st.column_config.SelectboxColumn(
-                "Résultats ?",
-                options=['', 'Significatifs', 'Non significatifs', 'Mitigés', 'Non rapportés'],
-                default=''
-            )
-            
-            column_config['Exclusion'] = st.column_config.SelectboxColumn(
-                "Exclusion",
-                options=['', 'Inclus', 'Exclu - Critères', 'Exclu - Qualité', 'Exclu - Pertinence', 'Exclu - Doublons'],
-                default=''
-            )
-            
-            # Configuration pour les colonnes textuelles
-            for col in ['title', 'abstract', 'authors', 'journal', 'Notes', 'WL = mesure', 'Chr = participants', 
-                       'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Outils', 'Additional outcomes / measures']:
-                if col in current_df.columns:
-                    column_config[col] = st.column_config.TextColumn(
-                        col,
-                        width="medium",
-                        max_chars=500
-                    )
-            
-            # Configuration pour les colonnes numériques
-            if 'year' in current_df.columns:
-                column_config['year'] = st.column_config.NumberColumn(
-                    "Année",
-                    min_value=1800,
-                    max_value=2030,
-                    step=1
-                )
-            
-            if 'cited_by' in current_df.columns:
-                column_config['cited_by'] = st.column_config.NumberColumn(
-                    "Citations",
-                    min_value=0,
-                    step=1
-                )
-            
-            # Options d'affichage
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                show_analysis_only = st.checkbox("📊 Afficher seulement les colonnes d'analyse", value=False)
-            with col2:
-                show_basic_only = st.checkbox("📄 Afficher seulement les métadonnées", value=False)
-            with col3:
-                compact_view = st.checkbox("🗜️ Vue compacte", value=False)
-            
-            # Filtrer les colonnes selon le choix
-            if show_analysis_only:
-                visible_columns = [col for col in current_df.columns if col in analysis_columns]
-            elif show_basic_only:
-                basic_columns = ['title', 'abstract', 'authors', 'journal', 'year', 'doi', 'cited_by', 'url', 'source', 'type']
-                visible_columns = [col for col in current_df.columns if col in basic_columns]
-            else:
-                # Réorganiser les colonnes : métadonnées d'abord, puis analyse
-                basic_columns = ['title', 'abstract', 'authors', 'journal', 'year', 'doi', 'cited_by', 'url', 'source', 'type']
-                basic_cols_present = [col for col in basic_columns if col in current_df.columns]
-                analysis_cols_present = [col for col in analysis_columns if col in current_df.columns]
-                other_cols = [col for col in current_df.columns if col not in basic_columns and col not in analysis_columns]
-                visible_columns = basic_cols_present + analysis_cols_present + other_cols
-            
-            # Créer une vue filtrée du DataFrame
-            df_to_edit = current_df[visible_columns].copy()
-            
-            # Tableau éditable avec scrolling
-            edited_df = st.data_editor(
-                df_to_edit,
-                column_config=column_config,
-                use_container_width=True,
-                height=600 if not compact_view else 400,
-                hide_index=False,
-                num_rows="dynamic",  # Permet d'ajouter/supprimer des lignes
-                key="article_editor"
-            )
-            
-            # Sauvegarder automatiquement les modifications
-            if not edited_df.equals(df_to_edit):
-                # Mettre à jour le DataFrame principal avec les modifications
-                for col in visible_columns:
-                    if col in current_df.columns:
-                        current_df[col] = edited_df[col]
-                
-                st.session_state['excel_data'] = current_df.copy()
-                
-                # Calculer les modifications
-                changes_count = 0
-                for col in visible_columns:
-                    if col in current_df.columns and col in df_to_edit.columns:
-                        if not current_df[col].equals(df_to_edit[col]):
-                            changes_count += 1
-                
-                if changes_count > 0:
-                    st.success(f"✅ **{changes_count} colonne(s) modifiée(s)** - Sauvegarde automatique effectuée!")
-            
-            # Statistiques et informations
-            st.markdown("---")
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("📄 Total Articles", len(current_df))
-            
-            with col2:
-                analysis_filled = 0
-                for col in analysis_columns:
-                    if col in current_df.columns:
-                        analysis_filled += (current_df[col].astype(str).str.strip() != '').sum()
-                st.metric("📊 Champs Analyse Remplis", analysis_filled)
-            
-            with col3:
-                total_fields = len(visible_columns) * len(current_df)
-                filled_fields = 0
-                for col in visible_columns:
-                    if col in current_df.columns:
-                        filled_fields += (current_df[col].astype(str).str.strip() != '').sum()
-                completion_rate = (filled_fields / total_fields * 100) if total_fields > 0 else 0
-                st.metric("✅ Taux Completion", f"{completion_rate:.1f}%")
-            
-            with col4:
-                st.metric("🔍 Colonnes Visibles", len(visible_columns))
-            
-            # Actions globales
-            st.markdown("### 🛠️ Actions Globales")
-            action_col1, action_col2, action_col3 = st.columns(3)
-            
-            with action_col1:
-                if st.button("🔄 Réinitialiser les colonnes d'analyse"):
-                    for col in analysis_columns:
-                        if col in current_df.columns:
-                            current_df[col] = ""
-                    st.session_state['excel_data'] = current_df.copy()
-                    st.success("✅ Colonnes d'analyse réinitialisées!")
-                    st.rerun()
-            
-            with action_col2:
-                if st.button("🧹 Nettoyer les cellules vides"):
-                    for col in current_df.columns:
-                        current_df[col] = current_df[col].astype(str).str.strip()
-                        current_df[col] = current_df[col].replace('', pd.NA)
-                    st.session_state['excel_data'] = current_df.copy()
-                    st.success("✅ Cellules vides nettoyées!")
-                    st.rerun()
-            
-            with action_col3:
-                if st.button("📋 Copier configuration"):
-                    st.info("💡 Configuration du tableau sauvegardée automatiquement!")
-            
-            # Message d'aide
-            with st.expander("💡 Aide - Utilisation du Tableau"):
-                st.markdown("""
-                **🎯 Comment utiliser ce tableau :**
-                
-                1. **Édition directe :** Cliquez sur n'importe quelle cellule pour la modifier
-                2. **Navigation :** Utilisez les barres de défilement horizontale et verticale
-                3. **Colonnes spécialisées :** Utilisez les listes déroulantes pour les champs prédéfinis
-                4. **Sauvegarde automatique :** Toutes vos modifications sont sauvées en temps réel
-                5. **Filtres d'affichage :** Utilisez les cases à cocher pour voir seulement certaines colonnes
-                6. **Ajout/Suppression :** Utilisez les boutons + et - pour gérer les lignes
-                
-                **✅ Avantages :**
-                - Aucune perte de données lors de la navigation
-                - Vue d'ensemble complète de tous vos articles
-                - Modification rapide et intuitive
-                - Scrolling infini pour gérer des milliers d'articles
-                """)
-        
-        # Export final
-        st.subheader("📥 Export Final")
-        
-        # Afficher un résumé des colonnes qui seront exportées
-        analysis_columns = ['ABS 1 OU 0', 'Notes', 'Type revue', 'WL = mesure', 'Chr = participants', 
-                          'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Simulation ?', 
-                          'Outils', 'Résultats ?', 'Additional outcomes / measures', 'Exclusion']
-        
-        existing_analysis = [col for col in analysis_columns if col in df.columns]
-        basic_columns = [col for col in df.columns if col not in analysis_columns]
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**📄 Métadonnées incluses:**")
-            st.write(f"• {len(basic_columns)} colonnes de base")
-            if len(basic_columns) > 0:
-                st.caption(", ".join(basic_columns[:5]) + ("..." if len(basic_columns) > 5 else ""))
-        
-        with col2:
-            st.write("**📊 Colonnes d'analyse incluses:**")
-            st.write(f"• {len(existing_analysis)} colonnes d'analyse")
-            if len(existing_analysis) > 0:
-                st.caption(", ".join(existing_analysis[:3]) + ("..." if len(existing_analysis) > 3 else ""))
-        
-        if len(existing_analysis) > 0:
-            st.success(f"✅ Toutes vos colonnes d'analyse bibliographique sont incluses dans l'export!")
-        else:
-            st.info("💡 Ajoutez les colonnes d'analyse avec le bouton '📊 Ajouter colonnes d'analyse'")
-        
-        export_filename = st.text_input(
-            "Nom du fichier Excel final",
-            value=f"revue_litterature_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         )
-        
-        if st.button("💾 Générer Excel Personnalisé", type="primary"):
-            # S'assurer qu'on utilise les données les plus récentes du session_state
-            df_to_export = st.session_state.get('excel_data', df).copy()
+        fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+        fig_pie.update_layout(height=350, showlegend=True)
+        st.plotly_chart(fig_pie, use_container_width=True)
+    
+    with col_chart2:
+        if 'date_action' in df_stats.columns:
+            st.markdown("#### 📈 Évolution du tri par jour")
+            daily_stats = df_stats.groupby(['date_only', 'status']).size().reset_index(name='count')
             
-            # Vérification de debug
-            st.info(f"🔍 Export de {len(df_to_export)} articles avec {len(df_to_export.columns)} colonnes")
-            
-            # Créer le fichier Excel avec multiples feuilles
-            output = io.BytesIO()
-            
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Feuille principale avec TOUTES les colonnes (utiliser df_to_export)
-                df_to_export.to_excel(writer, sheet_name='Données Customisées', index=False)
-                
-                # Feuille de statistiques avancées
-                stats_data = {
-                    'Métrique': [
-                        'Total articles',
-                        'Articles avec résumé (ABS 1 OU 0 = 1)',
-                        'Articles analysés (Notes remplies)',
-                        'Articles inclus (Exclusion = Inclus)',
-                        'Articles exclus',
-                        'Types de revues identifiés',
-                        'Spécialités identifiées',
-                        'Sources uniques',
-                        'Plage d\'années',
-                        'Citations totales'
-                    ],
-                    'Valeur': [
-                        len(df_to_export),
-                        (df_to_export['ABS 1 OU 0'] == '1').sum() if 'ABS 1 OU 0' in df_to_export.columns else 0,
-                        (df_to_export['Notes'].str.strip() != '').sum() if 'Notes' in df_to_export.columns else 0,
-                        (df_to_export['Exclusion'] == 'Inclus').sum() if 'Exclusion' in df_to_export.columns else 0,
-                        (df_to_export['Exclusion'].str.contains('Exclu', na=False)).sum() if 'Exclusion' in df_to_export.columns else 0,
-                        df_to_export['Type revue'].nunique() if 'Type revue' in df_to_export.columns else 0,
-                        df_to_export['Spécialité'].nunique() if 'Spécialité' in df_to_export.columns else 0,
-                        df_to_export['source'].nunique() if 'source' in df_to_export.columns else 0,
-                        f"{df_to_export['year'].min()}-{df_to_export['year'].max()}" if 'year' in df_to_export.columns and df_to_export['year'].notna().any() else "N/A",
-                        df_to_export['cited_by'].sum() if 'cited_by' in df_to_export.columns else 0
-                    ]
-                }
-                stats_df = pd.DataFrame(stats_data)
-                stats_df.to_excel(writer, sheet_name='Statistiques', index=False)
-                
-                # Feuille de répartition par type de revue
-                if 'Type revue' in df_to_export.columns:
-                    type_counts = df_to_export['Type revue'].value_counts().reset_index()
-                    type_counts.columns = ['Type de revue', 'Nombre']
-                    type_counts.to_excel(writer, sheet_name='Types de revues', index=False)
-                
-                # Feuille de répartition par spécialité
-                if 'Spécialité' in df_to_export.columns:
-                    specialty_counts = df_to_export['Spécialité'].value_counts().reset_index()
-                    specialty_counts.columns = ['Spécialité', 'Nombre']
-                    specialty_counts.to_excel(writer, sheet_name='Spécialités', index=False)
-                
-                # Feuille de répartition par source
-                if 'source' in df_to_export.columns:
-                    source_counts = df_to_export['source'].value_counts().reset_index()
-                    source_counts.columns = ['Source', 'Nombre']
-                    source_counts.to_excel(writer, sheet_name='Répartition Sources', index=False)
-                
-                # Feuille des colonnes d'analyse pour référence
-                analysis_columns = ['ABS 1 OU 0', 'Notes', 'Type revue', 'WL = mesure', 'Chr = participants', 
-                                  'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Simulation ?', 
-                                  'Outils', 'Résultats ?', 'Additional outcomes / measures', 'Exclusion']
-                
-                existing_analysis = [col for col in analysis_columns if col in df_to_export.columns]
-                if existing_analysis:
-                    analysis_info = pd.DataFrame({
-                        'Colonne d\'analyse': existing_analysis,
-                        'Description': [
-                            '1 = Résumé présent, 0 = Pas de résumé',
-                            'Notes libres sur l\'article',
-                            'Type d\'étude (Revue systématique, ECR, etc.)',
-                            'Mesures de résultats (WL = Working List)',
-                            'Caractéristiques des participants',
-                            'Spécialité médicale',
-                            'Type d\'intervention étudiée',
-                            'Technique utilisée',
-                            'Contexte de l\'étude',
-                            'Oui/Non si c\'est une simulation',
-                            'Outils ou instruments utilisés',
-                            'Résultats significatifs ou non',
-                            'Mesures de résultats additionnelles',
-                            'Statut d\'inclusion/exclusion'
-                        ][:len(existing_analysis)]
-                    })
-                    analysis_info.to_excel(writer, sheet_name='Légende Analyse', index=False)
-            
-            output.seek(0)
-            
-            # Bouton de téléchargement
-            # Validation et statistiques de l'export
-            analysis_columns = ['ABS 1 OU 0', 'Notes', 'Type revue', 'WL = mesure', 'Chr = participants', 
-                              'Spécialité', 'Intervention', 'Technique', 'Contexte', 'Simulation ?', 
-                              'Outils', 'Résultats ?', 'Additional outcomes / measures', 'Exclusion']
-            
-            filled_analysis_cols = []
-            for col in analysis_columns:
-                if col in df_to_export.columns:
-                    filled_count = (df_to_export[col].astype(str).str.strip() != '').sum()
-                    if filled_count > 0:
-                        filled_analysis_cols.append(f"{col} ({filled_count})")
-            
-            st.download_button(
-                label="⬇️ Télécharger Excel Personnalisé",
-                data=output.getvalue(),
-                file_name=export_filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            fig_line = px.line(
+                daily_stats, 
+                x='date_only', 
+                y='count', 
+                color='status',
+                color_discrete_map={
+                    'accept': '#00e1c6',
+                    'reject': '#ff6b6b', 
+                    'aside': '#ffd93d'
+                },
+                title="Articles triés par jour"
             )
+            fig_line.update_layout(height=350)
+            st.plotly_chart(fig_line, use_container_width=True)
+    
+    # Ligne 2: Top Journals + Activité par utilisateur
+    col_chart3, col_chart4 = st.columns(2)
+    
+    with col_chart3:
+        if 'journal' in df_stats.columns and df_stats['journal'].notna().sum() > 0:
+            st.markdown("#### 📰 Top 10 Journals")
+            top_journals = df_stats[df_stats['journal'].notna()]['journal'].value_counts().head(10)
             
-            st.success("✅ Fichier Excel personnalisé créé avec succès!")
+            fig_bar = px.bar(
+                x=top_journals.values,
+                y=top_journals.index,
+                orientation='h',
+                color=top_journals.values,
+                color_continuous_scale='viridis'
+            )
+            fig_bar.update_layout(
+                height=350,
+                yaxis={'categoryorder': 'total ascending'},
+                coloraxis_showscale=False
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+    
+    with col_chart4:
+        if 'user' in df_stats.columns:
+            st.markdown("#### 👥 Activité par utilisateur")
+            user_stats = df_stats.groupby(['user', 'status']).size().reset_index(name='count')
             
-            if filled_analysis_cols:
-                st.info(f"📊 Colonnes d'analyse avec données: {', '.join(filled_analysis_cols)}")
-            else:
-                st.warning("⚠️ Aucune colonne d'analyse n'a été remplie")
+            fig_user = px.bar(
+                user_stats,
+                x='user',
+                y='count',
+                color='status',
+                color_discrete_map={
+                    'accept': '#00e1c6',
+                    'reject': '#ff6b6b', 
+                    'aside': '#ffd93d'
+                },
+                title="Articles par utilisateur et statut"
+            )
+            fig_user.update_layout(height=350)
+            st.plotly_chart(fig_user, use_container_width=True)
+    
+    # Ligne 3: Distribution par année + Spécialités
+    col_chart5, col_chart6 = st.columns(2)
+    
+    with col_chart5:
+        if 'year' in df_stats.columns and df_stats['year'].notna().sum() > 0:
+            st.markdown("#### 📅 Distribution par année de publication")
+            year_data = df_stats[df_stats['year'].notna()]['year'].astype(str)
+            year_counts = year_data.value_counts().sort_index()
             
-            # Information détaillée sur l'export
-            with st.expander("ℹ️ Détails de l'export"):
-                st.write("**Contenu du fichier Excel:**")
-                st.write(f"• **Feuille 'Données Customisées'**: {len(df_to_export)} articles avec {len(df_to_export.columns)} colonnes")
-                st.write(f"• **Feuille 'Statistiques'**: Métriques détaillées")
-                st.write(f"• **Feuille 'Types de revues'**: Répartition par type d'étude")
-                st.write(f"• **Feuille 'Spécialités'**: Répartition par domaine médical")
-                st.write(f"• **Feuille 'Répartition Sources'**: Origine des articles")
-                st.write(f"• **Feuille 'Légende Analyse'**: Description des colonnes d'analyse")
-                
-                if len(filled_analysis_cols) > 0:
-                    st.success(f"✅ {len(filled_analysis_cols)} colonnes d'analyse contiennent des données")
-                
-                # Afficher un échantillon des colonnes modifiées
-                st.write("**Aperçu des colonnes d'analyse:**")
-                # Vérifier quelles colonnes existent vraiment
-                available_basic_cols = [col for col in ['title', 'authors', 'journal', 'year'] if col in df_to_export.columns]
-                sample_analysis_cols = [col for col in analysis_columns[:5] if col in df_to_export.columns]
-                sample_cols = available_basic_cols[:2] + sample_analysis_cols[:3]  # Prendre au max 5 colonnes
-                
-                if len(df_to_export) > 0 and sample_cols:
-                    st.dataframe(df_to_export[sample_cols].head(3), use_container_width=True)
-                else:
-                    st.info("Aucune donnée à afficher dans l'aperçu")
+            fig_year = px.bar(
+                x=year_counts.index,
+                y=year_counts.values,
+                color=year_counts.values,
+                color_continuous_scale='plasma'
+            )
+            fig_year.update_layout(
+                height=350,
+                xaxis_title="Année",
+                yaxis_title="Nombre d'articles",
+                coloraxis_showscale=False
+            )
+            st.plotly_chart(fig_year, use_container_width=True)
+    
+    with col_chart6:
+        if 'specialiste' in df_stats.columns and df_stats['specialiste'].notna().sum() > 0:
+            st.markdown("#### 🏥 Top Spécialités")
+            spec_counts = df_stats[df_stats['specialiste'].notna()]['specialiste'].value_counts().head(8)
+            
+            fig_spec = px.bar(
+                x=spec_counts.index,
+                y=spec_counts.values,
+                color=spec_counts.values,
+                color_continuous_scale='turbo'
+            )
+            fig_spec.update_layout(
+                height=350,
+                xaxis_title="Spécialité",
+                yaxis_title="Nombre d'articles",
+                coloraxis_showscale=False,
+                xaxis={'tickangle': 45}
+            )
+            st.plotly_chart(fig_spec, use_container_width=True)
+    
+    # Graphique de synthèse: Heatmap temporelle
+    if 'date_action' in df_stats.columns:
+        st.markdown("#### 🔥 Heatmap de l'activité de tri")
+        
+        # Créer des données pour la heatmap
+        df_stats['hour'] = df_stats['date_action'].dt.hour
+        df_stats['day_name'] = df_stats['date_action'].dt.day_name()
+        
+        heatmap_data = df_stats.groupby(['day_name', 'hour']).size().reset_index(name='count')
+        heatmap_pivot = heatmap_data.pivot(index='day_name', columns='hour', values='count').fillna(0)
+        
+        # Réordonner les jours
+        day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        heatmap_pivot = heatmap_pivot.reindex([day for day in day_order if day in heatmap_pivot.index])
+        
+        fig_heatmap = px.imshow(
+            heatmap_pivot,
+            color_continuous_scale='viridis',
+            aspect='auto',
+            labels=dict(x="Heure", y="Jour", color="Articles triés")
+        )
+        fig_heatmap.update_layout(height=300)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
 
-def configuration_apis():
-    """Interface de configuration des APIs."""
-    
-    st.markdown("""
-    **Configuration et Test des APIs Scientifiques**
-    
-    Toutes les APIs utilisées sont **gratuites** et ne nécessitent pas de clé d'accès.
-    """)
-    
-    # Statut des APIs
-    st.subheader("📡 Statut des APIs")
-    
-    for api_name, config in API_CONFIG.items():
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.write(f"**{api_name.title()}**")
-        
-        with col2:
-            st.write("✅ Gratuite" if config["free"] else "💰 Payante")
-        
-        with col3:
-            st.write(f"⚡ {config['rate_limit']}/s" if 'second' in str(config['rate_limit']) else f"⚡ {config['rate_limit']}/min")
-        
-        with col4:
-            if st.button(f"🧪 Tester {api_name}", key=f"test_{api_name}"):
-                test_api(api_name)
-    
-    # Informations détaillées
-    st.subheader("📚 Détails des APIs")
-    
-    with st.expander("🌐 OpenAlex"):
-        st.markdown("""
-        **OpenAlex** - Base de données bibliographique open source
-        - ✅ Entièrement gratuite
-        - 📊 250M+ articles scientifiques
-        - 🔄 Mise à jour quotidienne
-        - 🏷️ Métadonnées complètes (auteurs, institutions, citations)
-        - 🌍 Couvre toutes les disciplines
-        """)
-    
-    with st.expander("🧠 Semantic Scholar"):
-        st.markdown("""
-        **Semantic Scholar** - Moteur de recherche académique avec IA
-        - ✅ Gratuite (limite: 100 req/min)
-        - 🤖 Analyse sémantique avancée
-        - 📈 Métriques d'influence
-        - 📄 200M+ articles
-        - 🔗 Graphe de citations intelligent
-        """)
-    
-    with st.expander("🏥 PubMed"):
-        st.markdown("""
-        **PubMed** - Base biomédicale officielle NCBI
-        - ✅ Entièrement gratuite
-        - 🏥 Focus biomédical et vie sciences
-        - 📚 35M+ références
-        - 🏛️ Source officielle gouvernementale
-        - 📋 Abstracts de qualité garantie
-        """)
-    
-    with st.expander("📄 Crossref"):
-        st.markdown("""
-        **Crossref** - Métadonnées d'articles académiques
-        - ✅ Gratuite avec politeness policy
-        - 🔗 135M+ enregistrements
-        - 📊 Métadonnées DOI officielles
-        - 🏢 Sources d'éditeurs certifiés
-        - 📅 Données de publication précises
-        """)
+# Fin du conteneur principal centré
+st.markdown('</div>', unsafe_allow_html=True)
 
-def test_api(api_name: str):
-    """Tester une API spécifique."""
-    try:
-        if api_name == "openalex":
-            api = OpenAlexAPI()
-            result = api.search_works("covid", 2023, 2024, 5)
-        elif api_name == "semantic_scholar":
-            api = SemanticScholarAPI()
-            result = api.search_papers("machine learning", 2023, 2024, 5)
-        elif api_name == "pubmed":
-            api = PubMedAPI()
-            result = api.search_articles("cancer therapy", 2023, 2024, 5)
-        elif api_name == "crossref":
-            api = CrossrefAPI()
-            result = api.search_works("artificial intelligence", 2023, 2024, 5)
-        
-        if not result.empty:
-            st.success(f"✅ {api_name.title()}: {len(result)} articles trouvés")
-            st.dataframe(result[['title', 'authors', 'year']].head(3))
-        else:
-            st.warning(f"⚠️ {api_name.title()}: Test réussi mais aucun résultat")
-    
-    except Exception as e:
-        st.error(f"❌ {api_name.title()}: Erreur - {e}")
-
-if __name__ == "__main__":
-    main()
+# === FOOTER ===
+st.markdown("""
+<div class="footer">
+  🧠 NeuroScience Literature Triager – v3 avec persistance MySQL
+</div>
+""", unsafe_allow_html=True)
