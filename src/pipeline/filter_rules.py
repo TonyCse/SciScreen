@@ -226,15 +226,21 @@ class FilterEngine:
         
         before_count = len(df)
         
+        # Safely access columns that may be missing
+        title_col = df.get('title', pd.Series(index=df.index, dtype=object))
+        abstract_col = df.get('abstract', pd.Series(index=df.index, dtype=object))
+        doi_col = df.get('doi', pd.Series(index=df.index, dtype=object))
+        pmid_col = df.get('pmid', pd.Series(index=df.index, dtype=object))
+
         # Require title and at least one of: abstract, DOI, PMID
         mask = (
-            df['title'].notna() &
-            (df['title'] != "") &
-            (df['title'].str.strip() != "") &
+            title_col.notna() &
+            (title_col != "") &
+            (title_col.astype(str).str.strip() != "") &
             (
-                (df['abstract'].notna() & (df['abstract'] != "")) |
-                (df['doi'].notna() & (df['doi'] != "")) |
-                (df['pmid'].notna() & (df['pmid'] != ""))
+                (abstract_col.notna() & (abstract_col != "")) |
+                (doi_col.notna() & (doi_col != "")) |
+                (pmid_col.notna() & (pmid_col != ""))
             )
         )
         

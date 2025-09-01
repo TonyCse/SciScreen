@@ -6,12 +6,10 @@ title matching.
 """
 
 import logging
+from difflib import SequenceMatcher
 from typing import Dict, List, Tuple
 
 import pandas as pd
-from fuzzywuzzy import fuzz
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 from ..config import config
 
@@ -188,14 +186,13 @@ class Deduplicator:
             title_norm = row.get('title_normalized', '').strip()
             if not title_norm:
                 continue
-            
-            # Create block key from first 3 words
-            words = title_norm.split()[:3]
+
+            # Create block key from the first two words to allow small variations
+            # (e.g. singular/plural differences) to still fall into the same block.
+            words = title_norm.split()[:2]
             if len(words) >= 2:  # Require at least 2 words
                 block_key = ' '.join(words)
-                if block_key not in blocks:
-                    blocks[block_key] = []
-                blocks[block_key].append(idx)
+                blocks.setdefault(block_key, []).append(idx)
         
         # Only keep blocks with multiple items
         return {k: v for k, v in blocks.items() if len(v) > 1}
@@ -231,7 +228,7 @@ class Deduplicator:
                 pass
         
         # Calculate similarity
-        ratio = fuzz.ratio(title1, title2)
+        ratio = int(SequenceMatcher(None, title1, title2).ratio() * 100)
         
         # Use different thresholds based on title length
         if len(title1) < 30 or len(title2) < 30:
