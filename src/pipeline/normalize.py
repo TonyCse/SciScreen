@@ -10,12 +10,16 @@ import string
 from typing import Dict, List, Optional
 
 import pandas as pd
-from langdetect import detect, DetectorFactory
+try:
+    from langdetect import detect, DetectorFactory
+
+    # Set seed for consistent language detection
+    DetectorFactory.seed = 0
+except Exception:  # ModuleNotFoundError or other issues
+    detect = None
+    DetectorFactory = None
 
 from ..config import config
-
-# Set seed for consistent language detection
-DetectorFactory.seed = 0
 
 logger = logging.getLogger(__name__)
 
@@ -89,22 +93,34 @@ def clean_authors(authors: str) -> str:
     if not authors or pd.isna(authors):
         return ""
     
-    # Convert to string
-    authors = str(authors).strip()
-    
-    # Remove HTML tags
-    authors = re.sub(r'<[^>]+>', '', authors)
-    
-    # Normalize separators
-    authors = re.sub(r'[,;]\s*', '; ', authors)
-    
-    # Remove multiple spaces
-    authors = re.sub(r'\s+', ' ', authors)
-    
-    # Remove leading/trailing punctuation
-    authors = authors.strip(string.punctuation + string.whitespace)
-    
-    return authors
+    # Convert to string and remove HTML tags
+    authors = re.sub(r'<[^>]+>', '', str(authors).strip())
+
+    parts = []
+    current = []
+    comma_count = 0
+    for ch in authors:
+        if ch == ';':
+            if current:
+                parts.append(''.join(current).strip())
+            current = []
+            comma_count = 0
+        elif ch == ',':
+            if comma_count == 0:
+                current.append(ch)
+                comma_count = 1
+            else:
+                if current:
+                    parts.append(''.join(current).strip())
+                current = []
+                comma_count = 0
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current).strip())
+
+    cleaned = [p.strip(string.whitespace + string.punctuation) for p in parts if p]
+    return '; '.join(cleaned)
 
 
 def parse_authors(authors: str) -> List[str]:
@@ -121,17 +137,14 @@ def parse_authors(authors: str) -> List[str]:
     
     # Clean first
     authors = clean_authors(authors)
-    
-    # Split on common separators
-    author_list = re.split(r'[;,]\s*', authors)
-    
-    # Clean individual authors
-    cleaned_authors = []
-    for author in author_list:
-        author = author.strip()
-        if author:
-            cleaned_authors.append(author)
-    
+
+    if ';' in authors:
+        author_list = [a.strip() for a in authors.split(';')]
+    else:
+        # Fall back to splitting on commas between author entries
+        author_list = [a.strip() for a in re.split(r',\s*(?=[A-Z])', authors)]
+
+    cleaned_authors = [a for a in author_list if a]
     return cleaned_authors
 
 
@@ -204,21 +217,26 @@ def clean_abstract(abstract: str) -> str:
 
 def detect_language(text: str) -> str:
     """Detect language of text.
-    
+
     Args:
         text: Text to analyze
-        
+
     Returns:
         ISO 639-1 language code (e.g., 'en', 'fr')
     """
     if not text or pd.isna(text) or len(text.strip()) < 10:
         return ""
-    
+
+    if detect is None:
+        # Library not available; assume English as a sensible default
+        return "en"
+
     try:
         # Use title + abstract for better detection
         detected = detect(text)
         return detected
     except Exception:
+        logger.warning("Language detection failed", exc_info=True)
         return ""
 
 
@@ -283,8 +301,14 @@ def normalize_doc_type(doc_type: str, source: str = "") -> str:
     # Check for exact matches first
     if doc_type in type_mapping:
         return type_mapping[doc_type]
-    
-    # Check for partial matches
+
+    # Special handling to prioritise review types over generic article matches
+    if "review" in doc_type:
+        return "review"
+    if "article" in doc_type:
+        return "journal-article"
+
+    # Check for other partial matches
     for key, value in type_mapping.items():
         if key in doc_type or doc_type in key:
             return value
