@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -57,7 +58,7 @@ class ScreeningModel:
 
     @staticmethod
     def _tokenize(text: str) -> List[str]:
-        return [t for t in text.lower().split() if t]
+        return re.findall(r"\b\w+\b", text.lower())
 
     # ------------------------------------------------------------------
     # Core methods
@@ -155,7 +156,7 @@ class QueryBasedScorer:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        return set(str(text).lower().split())
+        return set(re.findall(r"\b\w+\b", str(text).lower()))
 
     def score_papers(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
         if df.empty:
